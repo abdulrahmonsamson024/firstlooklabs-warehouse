@@ -1,6 +1,6 @@
 {
-  "name": "Warehouse8 Quant FX Terminal",
-  "description": "A professional foreign exchange quantitative analytics terminal featuring dynamic multi-tier historical data ingestion, real-time news alignment, gap detection, and advanced charting.",
+  "name": "Remix: StillThere",
+  "description": "A safety check-in app that notifies emergency contacts if a user fails to confirm they are okay.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

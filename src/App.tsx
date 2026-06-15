@@ -76,6 +76,15 @@ function getCurrentWeekAndYear(): { year: number; week: number } {
   return { year, week: weekNum };
 }
 
+function isCryptoPair(symbol: string): boolean {
+  const s = String(symbol || "").toUpperCase().replace(/[-/_]/g, "").trim();
+  const cryptoBases = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "DOT", "LINK", "LTC", 
+    "MATIC", "SHIB", "TRX", "UNI", "ATOM", "ETC", "BCH", "XLM", "FIL", "LDO", "ICP", "SUI", "NEAR", "APT"
+  ];
+  return cryptoBases.some(cb => s.startsWith(cb)) || s.endsWith("USDT") || s.includes("USDT") || s === "BTCUSD" || s === "ETHUSD";
+}
+
 export default function App() {
   // Site Authentication Gated Portal Session State
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
@@ -356,7 +365,8 @@ export default function App() {
   const [isLoadingCandles, setIsLoadingCandles] = useState(false);
   const [selectedPair, setSelectedPair] = useState<string>("BTCUSD");
   const [selectedInterval, setSelectedInterval] = useState<MarketInterval>("1h");
-  const [selectedChartSource, setSelectedChartSource] = useState<"exness" | "dukascopy">("exness");
+  const [selectedChartSource, setSelectedChartSource] = useState<"exness" | "dukascopy" | "binance" | "bybit">("exness");
+  const [selectedTradeType, setSelectedTradeType] = useState<"spot" | "usdt_future" | "coin_future">("spot");
   const [showHistoricalLogs, setShowHistoricalLogs] = useState(false);
 
   // Chart range filter state (default: past 30 days)
@@ -372,6 +382,8 @@ export default function App() {
   // API Testing Playground State
   const [apiSymbol, setApiSymbol] = useState("EURUSD");
   const [apiSource, setApiSource] = useState("exness");
+  const [apiAssetCategory, setApiAssetCategory] = useState<"other" | "crypto">("other");
+  const [apiTradeType, setApiTradeType] = useState<"spot" | "usdt_future" | "coin_future">("spot");
   const [apiTimeframe, setApiTimeframe] = useState("1h");
   const [apiStartTime, setApiStartTime] = useState<string>(() => {
     const d = new Date();
@@ -938,7 +950,21 @@ export default function App() {
   const fetchCandles = async () => {
     setIsLoadingCandles(true);
     try {
-      let url = `/api/candles?pair=${encodeURIComponent(selectedPair)}&interval=${selectedInterval}&source=${selectedChartSource}`;
+      const isCrypto = isCryptoPair(selectedPair);
+      let activeSource = selectedChartSource;
+      if (isCrypto) {
+        if (activeSource !== "binance" && activeSource !== "bybit") {
+          activeSource = "binance";
+        }
+      } else {
+        if (activeSource === "binance" || activeSource === "bybit") {
+          activeSource = "exness";
+        }
+      }
+      let url = `/api/candles?pair=${encodeURIComponent(selectedPair)}&interval=${selectedInterval}&source=${activeSource}`;
+      if (isCrypto) {
+        url += `&tradeType=${encodeURIComponent(selectedTradeType)}`;
+      }
       if (chartStartDate) {
         url += `&startTime=${encodeURIComponent(chartStartDate)}`;
       }
@@ -1068,7 +1094,20 @@ export default function App() {
 
   useEffect(() => {
     fetchCandles();
-  }, [selectedPair, selectedInterval, selectedChartSource, chartStartDate, chartEndDate]);
+  }, [selectedPair, selectedInterval, selectedChartSource, selectedTradeType, chartStartDate, chartEndDate]);
+
+  useEffect(() => {
+    const isCrypto = isCryptoPair(selectedPair);
+    if (isCrypto) {
+      if (selectedChartSource !== "binance" && selectedChartSource !== "bybit") {
+        setSelectedChartSource("binance");
+      }
+    } else {
+      if (selectedChartSource === "binance" || selectedChartSource === "bybit") {
+        setSelectedChartSource("exness");
+      }
+    }
+  }, [selectedPair]);
 
   useEffect(() => {
     const gathered: string[] = [];
@@ -1085,13 +1124,20 @@ export default function App() {
       });
     }
     const finalPairs = gathered.length > 0 ? gathered : ["BTCUSD", "ETHUSD", "EURUSD", "AAPL"];
-    if (!finalPairs.includes(selectedPair.toUpperCase())) {
+    const cryptoDefaults = ["BTCUSD", "ETHUSD", "SOLUSDT", "BTCUSDT", "ETHUSDT"];
+    cryptoDefaults.forEach(cd => {
+      if (!finalPairs.map(p => p.toUpperCase()).includes(cd.toUpperCase())) {
+        finalPairs.push(cd);
+      }
+    });
+
+    if (!finalPairs.map(p => p.toUpperCase()).includes(selectedPair.toUpperCase())) {
       setSelectedPair(finalPairs[0]);
     }
-    if (!finalPairs.includes(apiSymbol.toUpperCase())) {
+    if (!finalPairs.map(p => p.toUpperCase()).includes(apiSymbol.toUpperCase())) {
       setApiSymbol(finalPairs[0]);
     }
-  }, [dbStatus, apiSymbol]);
+  }, [dbStatus, apiSymbol, selectedPair]);
 
   // Copy code helper
   const handleCopy = (text: string, id: string) => {
@@ -2887,9 +2933,10 @@ export default function App() {
               {/* Selector filter bar */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-[#0F1218] border border-[#1E232D] p-4 rounded-none">
                 {/* pair select */}
-                <div>
-                  <label className="block text-[10px] uppercase font-mono tracking-wider font-bold text-slate-400 mb-2">Asset Trading Pair</label>
-                  <div className="flex flex-wrap gap-1.5">
+                <div className="md:col-span-1 space-y-3">
+                  <div>
+                    <label className="block text-[10px] uppercase font-mono tracking-wider font-bold text-slate-400 mb-1.5">Asset Trading Pair Selector</label>
+                    
                     {(() => {
                       const gathered: string[] = [];
                       if (dbStatus.cockroachInstances && Array.isArray(dbStatus.cockroachInstances)) {
@@ -2905,20 +2952,71 @@ export default function App() {
                         });
                       }
                       const finalPairs = gathered.length > 0 ? gathered : ["BTCUSD", "ETHUSD", "EURUSD", "AAPL"];
-                      
-                      return finalPairs.map((pair) => (
-                        <button
-                          key={pair}
-                          onClick={() => setSelectedPair(pair)}
-                          className={`px-3 py-1.5 rounded-none font-mono text-xs font-bold cursor-pointer border transition-all ${
-                            selectedPair.toUpperCase() === pair.toUpperCase()
-                              ? "bg-[#151921] text-white border-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.2)]"
-                              : "bg-[#0A0C10] border-[#1E232D] text-slate-450 hover:border-[#3B82F6] hover:text-white"
-                          }`}
-                        >
-                          {pair}
-                        </button>
-                      ));
+                      const cryptoDefaults = ["BTCUSD", "ETHUSD", "SOLUSDT", "BTCUSDT", "ETHUSDT"];
+                      cryptoDefaults.forEach(cd => {
+                        if (!finalPairs.map(p => p.toUpperCase()).includes(cd.toUpperCase())) {
+                          finalPairs.push(cd);
+                        }
+                      });
+
+                      const cryptos = finalPairs.filter(p => isCryptoPair(p));
+                      const standards = finalPairs.filter(p => !isCryptoPair(p));
+
+                      const uniqueCryptos: string[] = [];
+                      const seenCryptoBases = new Set<string>();
+                      cryptos.forEach(p => {
+                        const base = p.toUpperCase().replace("USDT", "").replace("USD", "").replace("-", "").trim();
+                        if (!seenCryptoBases.has(base)) {
+                          seenCryptoBases.add(base);
+                          uniqueCryptos.push(p);
+                        }
+                      });
+
+                      return (
+                        <div className="space-y-3">
+                          {standards.length > 0 && (
+                            <div>
+                              <div className="text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-wider mb-1">Other</div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {standards.map((pair) => (
+                                  <button
+                                    key={pair}
+                                    onClick={() => setSelectedPair(pair)}
+                                    className={`px-2 py-1 rounded-none font-mono text-[11px] font-bold cursor-pointer border transition-all ${
+                                      selectedPair.toUpperCase() === pair.toUpperCase()
+                                        ? "bg-[#151921] text-white border-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.2)]"
+                                        : "bg-[#0A0C10] border-[#1E232D] text-slate-400 hover:border-[#3B82F6] hover:text-white"
+                                    }`}
+                                  >
+                                    {pair}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {uniqueCryptos.length > 0 && (
+                            <div>
+                              <div className="text-[10px] font-mono font-bold text-amber-400 uppercase tracking-wider mb-1">Crypto</div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {uniqueCryptos.map((pair) => (
+                                  <button
+                                    key={pair}
+                                    onClick={() => setSelectedPair(pair)}
+                                    className={`px-2 py-1 rounded-none font-mono text-[11px] font-bold cursor-pointer border transition-all ${
+                                      selectedPair.toUpperCase() === pair.toUpperCase()
+                                        ? "bg-[#151921] text-white border-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.2)]"
+                                        : "bg-[#0A0C10] border-[#1E232D] text-slate-450 hover:border-[#3B82F6] hover:text-white"
+                                    }`}
+                                  >
+                                    ★ {pair}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
                     })()}
                   </div>
                 </div>
@@ -2949,23 +3047,50 @@ export default function App() {
                 </div>
 
                 {/* Visualizer Feed Source select */}
-                <div>
-                  <label className="block text-[10px] uppercase font-mono tracking-wider font-bold text-slate-400 mb-2">Visualizer Feed Source</label>
-                  <div className="flex gap-1.5">
-                    {(["exness", "dukascopy"] as const).map((src) => (
-                      <button
-                        key={src}
-                        onClick={() => setSelectedChartSource(src)}
-                        className={`flex-1 px-3 py-1.5 rounded-none font-mono text-xs font-bold uppercase cursor-pointer border transition-all ${
-                          selectedChartSource === src
-                            ? "bg-[#151921] text-white border-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.2)]"
-                            : "bg-[#0A0C10] border-[#1E232D] text-slate-400 hover:border-[#3B82F6] hover:text-white"
-                        }`}
-                      >
-                        {src}
-                      </button>
-                    ))}
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-[10px] uppercase font-mono tracking-wider font-bold text-slate-400 mb-2">Visualizer Feed Source</label>
+                    <div className="flex gap-1.5">
+                      {(isCryptoPair(selectedPair) ? ["binance", "bybit"] : ["exness", "dukascopy"]).map((src) => (
+                        <button
+                          key={src}
+                          onClick={() => setSelectedChartSource(src as any)}
+                          className={`flex-1 px-3 py-1.5 rounded-none font-mono text-xs font-bold uppercase cursor-pointer border transition-all ${
+                            selectedChartSource === src
+                              ? "bg-[#151921] text-white border-[#3B82F6] shadow-[0_0_8px_rgba(59,130,246,0.2)]"
+                              : "bg-[#0A0C10] border-[#1E232D] text-slate-400 hover:border-[#3B82F6] hover:text-white"
+                          }`}
+                        >
+                          {src}
+                        </button>
+                      ))}
+                    </div>
                   </div>
+
+                  {isCryptoPair(selectedPair) && (
+                    <div className="animate-fade-in border-t border-[#1E232D]/45 pt-3">
+                      <label className="block text-[10px] uppercase font-mono tracking-wider font-bold text-slate-400 mb-2">Crypto Contract / Trade Type</label>
+                      <div className="flex gap-1.5">
+                        {([
+                          { id: "spot", label: "Spot" },
+                          { id: "usdt_future", label: "USDT Fut" },
+                          { id: "coin_future", label: "COIN Fut" }
+                        ] as const).map((t) => (
+                          <button
+                            key={t.id}
+                            onClick={() => setSelectedTradeType(t.id)}
+                            className={`flex-1 px-2 py-1.5 rounded-none font-mono text-[11px] font-bold uppercase cursor-pointer border transition-all ${
+                              selectedTradeType === t.id
+                                ? "bg-[#1A1813] border-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.2)] text-amber-400 font-bold"
+                                : "bg-[#0A0C10] border-[#1E232D] text-slate-400 hover:border-amber-500 hover:text-white"
+                            }`}
+                          >
+                            {t.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -3248,12 +3373,60 @@ export default function App() {
                 </div>
 
                 <form onSubmit={handleTestApi} className="bg-[#0A0C10] border border-[#1E232D] p-4 space-y-4 rounded-none">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8 gap-3">
+                    <div>
+                      <label className="block text-[10px] uppercase font-mono font-bold text-slate-400 mb-1.5">Asset Type</label>
+                      <div className="flex gap-1 bg-[#151921] border border-[#1E232D] p-1 items-center">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setApiAssetCategory("other");
+                            setApiSymbol("EURUSD");
+                            setApiSource("exness");
+                          }}
+                          className={`flex-1 text-center py-1 font-mono text-[9px] uppercase font-bold cursor-pointer transition-all ${
+                            apiAssetCategory === "other"
+                              ? "bg-[#3B82F6] text-white"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          Other
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setApiAssetCategory("crypto");
+                            setApiSymbol("BTCUSD");
+                            setApiSource("binance");
+                          }}
+                          className={`flex-1 text-center py-1 font-mono text-[9px] uppercase font-bold cursor-pointer transition-all ${
+                            apiAssetCategory === "crypto"
+                              ? "bg-amber-500 text-black font-semibold"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          Crypto
+                        </button>
+                      </div>
+                    </div>
+
                     <div>
                       <label className="block text-[10px] uppercase font-mono font-bold text-slate-405 mb-1.5">Symbol</label>
                       <select
                         value={apiSymbol}
-                        onChange={(e) => setApiSymbol(e.target.value)}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setApiSymbol(val);
+                          if (isCryptoPair(val)) {
+                            if (apiSource !== "binance" && apiSource !== "bybit") {
+                              setApiSource("binance");
+                            }
+                          } else {
+                            if (apiSource === "binance" || apiSource === "bybit") {
+                              setApiSource("exness");
+                            }
+                          }
+                        }}
                         className="w-full bg-[#151921] border border-[#1E232D] text-xs text-white p-2 focus:outline-none focus:border-blue-500 font-mono uppercase cursor-pointer"
                       >
                         {(() => {
@@ -3271,9 +3444,35 @@ export default function App() {
                             });
                           }
                           const finalPairs = gathered.length > 0 ? gathered : ["BTCUSD", "ETHUSD", "EURUSD", "AAPL"];
-                          return finalPairs.map((pair) => (
-                            <option key={pair} value={pair}>{pair}</option>
-                          ));
+                          const cryptoDefaults = ["BTCUSD", "ETHUSD", "SOLUSDT", "BTCUSDT", "ETHUSDT"];
+                          cryptoDefaults.forEach(cd => {
+                            if (!finalPairs.map(p => p.toUpperCase()).includes(cd.toUpperCase())) {
+                              finalPairs.push(cd);
+                            }
+                          });
+                          
+                          const standards = finalPairs.filter(p => !isCryptoPair(p));
+                          const cryptos = finalPairs.filter(p => isCryptoPair(p));
+                          
+                          const uniqueCryptos: string[] = [];
+                          const seenCryptoBases = new Set<string>();
+                          cryptos.forEach(p => {
+                            const base = p.toUpperCase().replace("USDT", "").replace("USD", "").replace("-", "").trim();
+                            if (!seenCryptoBases.has(base)) {
+                              seenCryptoBases.add(base);
+                              uniqueCryptos.push(p);
+                            }
+                          });
+
+                          if (apiAssetCategory === "other") {
+                            return standards.map((pair) => (
+                              <option key={pair} value={pair}>{pair}</option>
+                            ));
+                          } else {
+                            return uniqueCryptos.map((pair) => (
+                              <option key={pair} value={pair}>{pair}</option>
+                            ));
+                          }
                         })()}
                       </select>
                     </div>
@@ -3285,10 +3484,34 @@ export default function App() {
                         onChange={(e) => setApiSource(e.target.value)}
                         className="w-full bg-[#151921] border border-[#1E232D] text-xs text-white p-2 focus:outline-none focus:border-blue-500 font-mono"
                       >
-                        <option value="exness">Exness Feed</option>
-                        <option value="dukascopy">Dukascopy Feed</option>
+                        {apiAssetCategory === "other" ? (
+                          <>
+                            <option value="exness">Exness Feed</option>
+                            <option value="dukascopy">Dukascopy Feed</option>
+                          </>
+                        ) : (
+                          <>
+                            <option value="binance">Binance Crypto API</option>
+                            <option value="bybit">Bybit Crypto API</option>
+                          </>
+                        )}
                       </select>
                     </div>
+
+                    {isCryptoPair(apiSymbol) && (
+                      <div className="animate-fade-in col-span-1">
+                        <label className="block text-[10px] uppercase font-mono font-bold text-slate-405 mb-1.5 text-amber-400">Trade Type</label>
+                        <select
+                          value={apiTradeType}
+                          onChange={(e) => setApiTradeType(e.target.value as any)}
+                          className="w-full bg-[#151921] border border-amber-500/40 text-xs text-amber-400 p-2 focus:outline-none focus:border-amber-500 font-mono"
+                        >
+                          <option value="spot">Spot</option>
+                          <option value="usdt_future">USDT Futures</option>
+                          <option value="coin_future">COIN Futures</option>
+                        </select>
+                      </div>
+                    )}
 
                     <div>
                       <label className="block text-[10px] uppercase font-mono font-bold text-slate-405 mb-1.5">Timeframe</label>
@@ -3394,7 +3617,7 @@ export default function App() {
                       <p>
                         <span className="text-blue-400 font-bold">GET</span>{" "}
                         <span className="text-slate-100 font-semibold break-all">
-                          /api/warehouse-candles?symbol={apiSymbol.toUpperCase()}&source={apiSource.toLowerCase()}&timeframe={apiTimeframe.toLowerCase()}{apiLimit ? `&limit=${apiLimit}` : ""}{apiStartTime ? `&startTime=${apiStartTime}` : ""}{apiEndTime ? `&endTime=${apiEndTime}` : ""}
+                          /api/warehouse-candles?symbol={apiSymbol.toUpperCase()}&source={apiSource.toLowerCase()}&timeframe={apiTimeframe.toLowerCase()}{isCryptoPair(apiSymbol) ? `&tradeType=${apiTradeType}` : ""}{apiLimit ? `&limit=${apiLimit}` : ""}{apiStartTime ? `&startTime=${apiStartTime}` : ""}{apiEndTime ? `&endTime=${apiEndTime}` : ""}
                         </span>
                       </p>
                       <div className="flex justify-between items-center gap-4 flex-wrap pt-1 border-t border-[#1E232D]/45 mt-1">
@@ -3564,6 +3787,104 @@ export default function App() {
                     </div>
                   </div>
                 )}
+              </div>
+
+              {/* QUANT API INTEGRATION GUIDELINE REFERENCE MANUAL */}
+              <div className="bg-[#0F1218] border border-[#1E232D] p-5 sm:p-6 rounded-none space-y-4">
+                <div className="flex items-center gap-2 border-b border-[#1E232D] pb-3">
+                  <Info className="h-5 w-5 text-amber-400" />
+                  <div>
+                    <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                      DEVELOPER INTEGRATION MANUAL: /api/warehouse-candles SPECIFICATION
+                    </h4>
+                    <p className="text-[10px] text-slate-400 uppercase font-mono tracking-widest mt-0.5">
+                      How to connect external trading engines, backtesters, or automated bots to Warehouse8 endpoints.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 text-xs text-slate-350 leading-relaxed font-mono">
+                  <div className="space-y-4">
+                    <p className="font-sans text-slate-300">
+                      Our system provides a single unified interface to query both <span className="text-cyan-400 font-bold">Standard Assets</span> (processed through cluster shards) and <span className="text-amber-400 font-semibold">Cryptocurrencies</span> (directly retrieved and translated in real-time with zero-spread from public gateways).
+                    </p>
+
+                    <div>
+                      <h5 className="text-slate-200 uppercase font-bold text-[10px] border-b border-[#1E232D] pb-1 mb-2 tracking-wider text-cyan-400 font-bold">
+                        HTTP Endpoint Signature
+                      </h5>
+                      <div className="bg-[#0A0C10] border border-[#1E232D] p-3 text-[11px] text-slate-200 break-all select-all font-mono">
+                        <span className="text-yellow-400 font-bold">GET</span> {window.location.origin}/api/warehouse-candles
+                      </div>
+                    </div>
+
+                    <div>
+                      <h5 className="text-slate-200 uppercase font-bold text-[10px] border-b border-[#1E232D] pb-1 mb-2 tracking-wider text-amber-400 font-bold">
+                        Query Parameters
+                      </h5>
+                      <ul className="space-y-2 text-[11px] list-disc pl-4 font-sans">
+                        <li>
+                          <strong className="font-mono text-slate-200">symbol</strong> (string): e.g., <code className="font-mono text-amber-500">BTCUSD</code>, <code className="font-mono text-amber-500">ETHUSD</code>, <code className="font-mono text-cyan-400">EURUSD</code>, or <code className="font-mono text-cyan-400">XAUUSD</code>.
+                        </li>
+                        <li>
+                          <strong className="font-mono text-slate-200">source</strong> (string): <code className="font-mono text-[#E0E6ED]">exness</code> or <code className="font-mono text-[#E0E6ED]">dukascopy</code> for forex; <code className="font-mono text-[#E0E6ED]">binance</code> or <code className="font-mono text-[#E0E6ED]">bybit</code> for cryptocurrencies.
+                        </li>
+                        <li>
+                          <strong className="font-mono text-slate-200">timeframe</strong> (string): Time interval. Supported: <code className="font-mono text-[#E0E6ED]">1m</code>, <code className="font-mono text-[#E0E6ED]">5m</code>, <code className="font-mono text-[#E0E6ED]">15m</code>, <code className="font-mono text-[#E0E6ED]">1h</code>, <code className="font-mono text-[#E0E6ED]">4h</code>, <code className="font-mono text-[#E0E6ED]">1d</code>.
+                        </li>
+                        <li>
+                          <strong className="font-mono text-slate-200">limit</strong> (integer): Number of historical bars to fetch. Maximum: <code className="font-mono text-emerald-400">1000</code>.
+                        </li>
+                        <li>
+                          <strong className="font-mono text-slate-200">startTime</strong> (string/ISO-8601): Only candles on or after this timestamp.
+                        </li>
+                        <li>
+                          <strong className="font-mono text-slate-200">endTime</strong> (string/ISO-8601): Only candles on or before this timestamp.
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div>
+                      <h5 className="text-slate-200 uppercase font-bold text-[10px] border-b border-[#1E232D] pb-1 mb-2 tracking-wider text-purple-400 font-bold">
+                        Javascript Fetch Example
+                      </h5>
+                      <div className="bg-[#030406] border border-[#1E232D] p-3 rounded-none text-[10.5px] font-mono text-emerald-400 whitespace-pre overflow-x-auto leading-normal">
+{`// 1. Define Request URL & Query Options
+const endpoint = '/api/warehouse-candles';
+const params = new URLSearchParams({
+  symbol: 'BTCUSD',
+  source: 'binance', // or 'bybit'
+  timeframe: '1h',
+  limit: '150'
+});
+
+// 2. Dispatch Secure Multi-Feed Connection
+fetch(\`\${endpoint}?\${params}\`)
+  .then(response => response.json())
+  .then(candles => {
+    console.log(\`Successfully fetched \${candles.length} bars:\`);
+    const lastBar = candles[candles.length - 1];
+    
+    console.log("Time (Unix):", lastBar.time);
+    console.log("Bid Open/Close:", lastBar.bid_open, lastBar.bid_close);
+    console.log("Spread (Zeroed):", lastBar.spread_open); // 0
+    console.log("Volume:", lastBar.volume);
+  })
+  .catch(err => console.error("API error:", err));`}
+                      </div>
+                    </div>
+
+                    <div className="p-3 bg-blue-950/10 border border-blue-500/10 text-[11px] font-sans leading-relaxed text-slate-400">
+                      <p className="font-bold font-mono text-blue-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                        <Sparkles className="h-3.5 w-3.5" />
+                        Professional Microstructure Mapping
+                      </p>
+                      To ensure drop-in compatibility with trading platforms, our multi-feed handler translates original single-ended exchange prices to professional dual broker layers. The <code className="font-mono text-slate-200">spread_high</code>, <code className="font-mono text-slate-200">spread_low</code>, <code className="font-mono text-slate-200">spread_open</code> and <code className="font-mono text-slate-200">spread_close</code> attributes are automatically standardized to <span className="font-mono text-emerald-400">0</span> while preserving authentic order volumes.
+                    </div>
+                  </div>
+                </div>
               </div>
 
             </div>
