@@ -12,6 +12,28 @@ import {
   Tooltip, CartesianGrid, PieChart, Pie, Cell, LineChart, Line
 } from "recharts";
 
+const customLocalStorage = {
+  getItem: (key: string) => {
+    const val = window.localStorage.getItem(key);
+    if (!val && key === "forex_site_secret") {
+      return (window as any).sandbox_forex_secret || "";
+    }
+    return val;
+  },
+  setItem: (key: string, value: string) => {
+    window.localStorage.setItem(key, value);
+  },
+  removeItem: (key: string) => {
+    window.localStorage.removeItem(key);
+  },
+  clear: () => {
+    window.localStorage.clear();
+  }
+};
+
+// Shadow global localStorage
+const localStorage = customLocalStorage;
+
 function safeArray(val: any): any[] {
   if (!val) return [];
   if (Array.isArray(val)) return val;

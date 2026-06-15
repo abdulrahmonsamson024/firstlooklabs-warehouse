@@ -2108,10 +2108,27 @@ async function startServer() {
       dailyTrendMap.set(dateStr, 0);
     }
 
-    // Default fallbacks using the local memory list
-    const logsToday = apiLogs.filter(l => (now - new Date(l.timestamp).getTime()) <= oneDayMs);
-    const logsWeek = apiLogs.filter(l => (now - new Date(l.timestamp).getTime()) <= sevenDaysMs);
-    const logsMonth = apiLogs.filter(l => (now - new Date(l.timestamp).getTime()) <= thirtyDaysMs);
+    // Start dates in UTC for today, this week, and this month
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    const todayStartMs = todayStart.getTime();
+
+    const weekStart = new Date();
+    weekStart.setUTCHours(0, 0, 0, 0);
+    const dayOfWeek = weekStart.getUTCDay(); // 0 = Sunday, 1 = Monday ...
+    // Using Sunday as standard start of the week
+    weekStart.setUTCDate(weekStart.getUTCDate() - dayOfWeek);
+    const weekStartMs = weekStart.getTime();
+
+    const monthStart = new Date();
+    monthStart.setUTCHours(0, 0, 0, 0);
+    monthStart.setUTCDate(1);
+    const monthStartMs = monthStart.getTime();
+
+    // UTC standard calendar-based filtering of local memory list
+    const logsToday = apiLogs.filter(l => new Date(l.timestamp).getTime() >= todayStartMs);
+    const logsWeek = apiLogs.filter(l => new Date(l.timestamp).getTime() >= weekStartMs);
+    const logsMonth = apiLogs.filter(l => new Date(l.timestamp).getTime() >= monthStartMs);
 
     let lifetimeRequests = apiLogs.length;
     let todayRequests = logsToday.length;
@@ -2131,9 +2148,9 @@ async function startServer() {
         const statsRes = await withTimeout(activePool.query(`
           SELECT 
             COUNT(*) as "lifetime",
-            COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '1 day') as "today",
-            COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '7 days') as "week",
-            COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '30 days') as "month",
+            COUNT(*) FILTER (WHERE timestamp >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')) as "today",
+            COUNT(*) FILTER (WHERE timestamp >= (DATE_TRUNC('week', (NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day') - INTERVAL '1 day')) as "week",
+            COUNT(*) FILTER (WHERE timestamp >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')) as "month",
             COUNT(*) FILTER (WHERE status_code = 401) as "unauthorized",
             COUNT(*) FILTER (WHERE secret_used = true) as "secrets_used",
             COALESCE(SUM(latency_ms), 0) as "total_latency"
@@ -3631,7 +3648,14 @@ async function startServer() {
       
       const cleanBaseUrl = adminApiUrl.endsWith("/") ? adminApiUrl.slice(0, -1) : adminApiUrl;
       const cleanSubpath = subpath.startsWith("/") ? subpath.slice(1) : subpath;
-      const targetUrl = `${cleanBaseUrl}/${cleanSubpath}${separator}${queryParams}`;
+      const normSubpath = subpath.toLowerCase().trim().replace(/^\/+|\/+$/g, "");
+
+      let targetUrl = `${cleanBaseUrl}/${cleanSubpath}${separator}${queryParams}`;
+
+      // To make cross-page search & full dataset paging work perfectly, fetch all records when requesting list subpaths
+      if (req.method === "GET" && (normSubpath === "users/list" || normSubpath === "finance/payments" || normSubpath === "audit-logs")) {
+        targetUrl = `${cleanBaseUrl}/${cleanSubpath}?limit=3000&range=All`;
+      }
 
       const headers: any = {
         "Content-Type": "application/json",
@@ -3670,7 +3694,162 @@ async function startServer() {
         throw new Error(`Remote API returned non-JSON response: ${contentType}. Body: ${textResponse.slice(0, 200)}`);
       }
 
-      const data = await response.json();
+      let data = await response.json();
+      
+      // 1. users/list intercept
+      if (normSubpath === "users/list" && data && Array.isArray(data.users)) {
+        let users = [...data.users];
+        
+        // Search Filter
+        const searchVal = (req.query.search as string || "").toLowerCase().trim();
+        if (searchVal) {
+          users = users.filter((u: any) => {
+            const name = (u.full_name || u.username || u.name || "").toLowerCase();
+            const email = (u.email || "").toLowerCase();
+            const country = (u.country || "").toLowerCase();
+            const id = (u.id || "").toLowerCase();
+            const plan = (u.plan || "").toLowerCase();
+            return name.includes(searchVal) || email.includes(searchVal) || country.includes(searchVal) || id.includes(searchVal) || plan.includes(searchVal);
+          });
+        }
+        
+        // Plan Filter
+        const planVal = (req.query.plan as string || "").toLowerCase().trim();
+        if (planVal && planVal !== "all") {
+          users = users.filter((u: any) => {
+            const rawPlan = (u.plan || "").toLowerCase().trim();
+            return rawPlan === planVal || rawPlan.includes(planVal);
+          });
+        }
+        
+        // Paginate
+        const total = users.length;
+        const limitVal = parseInt(req.query.limit as string || "10", 10);
+        const reqPage = parseInt(req.query.page as string || "1", 10);
+        const totalPages = Math.max(1, Math.ceil(total / limitVal));
+        const activePage = Math.min(reqPage, totalPages);
+        const startOffset = (activePage - 1) * limitVal;
+        const pagedUsers = users.slice(startOffset, startOffset + limitVal);
+        
+        data = {
+          ...data,
+          users: pagedUsers,
+          totalUsers: total,
+          total: total,
+          currentPage: activePage,
+          page: activePage,
+          totalPages: totalPages,
+          limit: limitVal
+        };
+      }
+      
+      // 2. finance/payments intercept
+      else if (normSubpath === "finance/payments" && data) {
+        let payments = Array.isArray(data.payments) ? [...data.payments] : [];
+        if (payments.length > 0) {
+          // Search Filter
+          const searchVal = (req.query.search as string || "").toLowerCase().trim();
+          if (searchVal) {
+            payments = payments.filter((p: any) => {
+              const email = (p.email || p.userEmail || "").toLowerCase();
+              const transactionId = (p.id || p.transactionId || "").toLowerCase();
+              const uName = (p.name || p.username || "").toLowerCase();
+              const plan = (p.plan || "").toLowerCase();
+              const paymentMethod = (p.paymentMethod || p.method || "").toLowerCase();
+              return email.includes(searchVal) || transactionId.includes(searchVal) || uName.includes(searchVal) || plan.includes(searchVal) || paymentMethod.includes(searchVal);
+            });
+          }
+          
+          // Plan Filter
+          const planVal = (req.query.plan as string || "").toLowerCase().trim();
+          if (planVal && planVal !== "all") {
+            payments = payments.filter((p: any) => {
+              const rawPlan = (p.plan || "").toLowerCase().trim();
+              return rawPlan === planVal || rawPlan.includes(planVal);
+            });
+          }
+          
+          // Status Filter
+          const statusVal = (req.query.status as string || "").toLowerCase().trim();
+          if (statusVal && statusVal !== "all") {
+            payments = payments.filter((p: any) => {
+              const rawStatus = (p.status || "").toLowerCase().trim();
+              return rawStatus === statusVal || rawStatus.includes(statusVal);
+            });
+          }
+          
+          const total = payments.length;
+          const limitVal = parseInt(req.query.limit as string || "10", 10);
+          const reqPage = parseInt(req.query.page as string || "1", 10);
+          const totalPages = Math.max(1, Math.ceil(total / limitVal));
+          const activePage = Math.min(reqPage, totalPages);
+          const startOffset = (activePage - 1) * limitVal;
+          const pagedPayments = payments.slice(startOffset, startOffset + limitVal);
+          
+          data = {
+            ...data,
+            payments: pagedPayments,
+            totalPayments: total,
+            total: total,
+            currentPage: activePage,
+            page: activePage,
+            totalPages: totalPages,
+            limit: limitVal
+          };
+        }
+      }
+      
+      // 3. audit-logs intercept
+      else if (normSubpath === "audit-logs" && data) {
+        let logs = Array.isArray(data.logs) ? [...data.logs] : Array.isArray(data.auditLogs) ? [...data.auditLogs] : Array.isArray(data) ? [...data] : [];
+        if (logs.length > 0) {
+          // Search Filter
+          const searchVal = (req.query.search as string || "").toLowerCase().trim();
+          if (searchVal) {
+            logs = logs.filter((l: any) => {
+              const email = (l.email || l.userEmail || "").toLowerCase();
+              const action = (l.action || "").toLowerCase();
+              const details = (l.details || l.description || "").toLowerCase();
+              const ip = (l.ipAddress || l.ip || "").toLowerCase();
+              return email.includes(searchVal) || action.includes(searchVal) || details.includes(searchVal) || ip.includes(searchVal);
+            });
+          }
+          
+          // Status/Severity Filter
+          const statusVal = (req.query.status as string || "").toLowerCase().trim();
+          if (statusVal && statusVal !== "all") {
+            logs = logs.filter((l: any) => {
+              const rawStatus = (l.severity || l.status || "").toLowerCase().trim();
+              return rawStatus === statusVal || rawStatus.includes(statusVal);
+            });
+          }
+          
+          const total = logs.length;
+          const limitVal = parseInt(req.query.limit as string || "12", 10);
+          const reqPage = parseInt(req.query.page as string || "1", 10);
+          const totalPages = Math.max(1, Math.ceil(total / limitVal));
+          const activePage = Math.min(reqPage, totalPages);
+          const startOffset = (activePage - 1) * limitVal;
+          const pagedLogs = logs.slice(startOffset, startOffset + limitVal);
+          
+          if (Array.isArray(data) && !(data as any).logs && !(data as any).auditLogs) {
+            data = pagedLogs;
+          } else {
+            const listKey = Array.isArray((data as any).logs) ? "logs" : "auditLogs";
+            data = {
+              ...(data as any),
+              [listKey]: pagedLogs,
+              totalLogs: total,
+              total: total,
+              currentPage: activePage,
+              page: activePage,
+              totalPages: totalPages,
+              limit: limitVal
+            };
+          }
+        }
+      }
+
       return res.json(data);
 
     } catch (err: any) {
@@ -6412,17 +6591,18 @@ async function startServer() {
       limitVal = 500;
     }
 
-    const isCrypto = isCryptoPair(symbol);
+    const reqTradeType = req.query.tradeType as string || req.query.trade_type as string;
     let querySource = source.toLowerCase().trim();
-    const tradeType = (req.query.tradeType as string || req.query.trade_type as string || 'spot').toLowerCase().trim();
+    const isCrypto = isCryptoPair(symbol) || !!reqTradeType || querySource === "binance" || querySource === "bybit";
+    const tradeType = (reqTradeType || 'spot').toLowerCase().trim();
 
-    // Safeguard asset source mismatch: if it's not a crypto pair, force fallback to exness
+    // Safeguard asset source mismatch: if it is explicitly NOT a crypto pair and no crypto indicator is present, force fallback to exness
     if (!isCrypto && (querySource === "binance" || querySource === "bybit")) {
       querySource = "exness";
     }
 
-    // If source is binance or bybit or we don't have a pool but it is a crypto pair, fetch from public API
-    if (querySource === "binance" || querySource === "bybit" || (isCrypto && querySource !== "exness" && querySource !== "dukascopy")) {
+    // If it is crypto or the source is binance or bybit, fetch directly from public crypto API
+    if (isCrypto || querySource === "binance" || querySource === "bybit") {
       const activeCryptoSource = (querySource === "binance" || querySource === "bybit") ? querySource : "binance";
       try {
         const result = await fetchCryptoCandles(activeCryptoSource, symbol, timeframe, limitVal, tradeType, startTime, endTime);
@@ -6452,13 +6632,29 @@ async function startServer() {
           }
         }
 
-        // Add additional metadata fields if useful
-        const finalData = withNews.map(c => ({
-          ...c,
-          id: undefined,
-          pair: symbol.toUpperCase(),
-          interval: timeframe,
-          timestamp: new Date(c.time * 1000).toISOString()
+        // Ensure accurate limit slice and precise limit mapping
+        let slicedResult = withNews;
+        if (slicedResult.length > limitVal) {
+          slicedResult = slicedResult.slice(-limitVal);
+        }
+
+        // Add additional metadata fields if useful, but format to exact requested properties of 15 keys
+        const finalData = slicedResult.map(c => ({
+          time: Number(c.time),
+          bid_open: parseFloat(Number(c.bid_open).toFixed(8)),
+          bid_high: parseFloat(Number(c.bid_high).toFixed(8)),
+          bid_low: parseFloat(Number(c.bid_low).toFixed(8)),
+          bid_close: parseFloat(Number(c.bid_close).toFixed(8)),
+          ask_open: parseFloat(Number(c.ask_open || c.bid_open).toFixed(8)),
+          ask_high: parseFloat(Number(c.ask_high || c.bid_high).toFixed(8)),
+          ask_low: parseFloat(Number(c.ask_low || c.bid_low).toFixed(8)),
+          ask_close: parseFloat(Number(c.ask_close || c.bid_close).toFixed(8)),
+          spread_open: parseFloat(Number(c.spread_open || 0).toFixed(8)),
+          spread_high: parseFloat(Number(c.spread_high || 0).toFixed(8)),
+          spread_low: parseFloat(Number(c.spread_low || 0).toFixed(8)),
+          spread_close: parseFloat(Number(c.spread_close || 0).toFixed(8)),
+          volume: parseFloat(Number(c.volume || 0).toFixed(8)),
+          news: c.news || []
         }));
 
         res.json(finalData);
@@ -6521,7 +6717,26 @@ async function startServer() {
             }
           }
 
-          res.json(withNews);
+          // Format with identical fields including exactly the 15 specified properties
+          const finalData = withNews.map(c => ({
+            time: Number(c.time),
+            bid_open: parseFloat(Number(c.bid_open).toFixed(8)),
+            bid_high: parseFloat(Number(c.bid_high).toFixed(8)),
+            bid_low: parseFloat(Number(c.bid_low).toFixed(8)),
+            bid_close: parseFloat(Number(c.bid_close).toFixed(8)),
+            ask_open: parseFloat(Number(c.ask_open || c.bid_open).toFixed(8)),
+            ask_high: parseFloat(Number(c.ask_high || c.bid_high).toFixed(8)),
+            ask_low: parseFloat(Number(c.ask_low || c.bid_low).toFixed(8)),
+            ask_close: parseFloat(Number(c.ask_close || c.bid_close).toFixed(8)),
+            spread_open: parseFloat(Number(c.spread_open || 0).toFixed(8)),
+            spread_high: parseFloat(Number(c.spread_high || 0).toFixed(8)),
+            spread_low: parseFloat(Number(c.spread_low || 0).toFixed(8)),
+            spread_close: parseFloat(Number(c.spread_close || 0).toFixed(8)),
+            volume: parseFloat(Number(c.volume || 0).toFixed(8)),
+            news: c.news || []
+          }));
+
+          res.json(finalData);
           return;
         } else {
           res.json([]);
@@ -6535,7 +6750,7 @@ async function startServer() {
     }
 
     res.status(400).json({
-      error: `No database configured for symbol '${symbol}'. Please verify that CockroachDB connections are correctly configured in your environment secrets.`
+      error: `No database connection is available for pair '${symbol}' or interval '${timeframe}'. Please verify that the database connection URLs inside the environment secrets (COCKROACH_DB_URL_1, COCKROACH_DB_URL_2, etc.) are correctly set up.`
     });
   });
 
@@ -7205,28 +7420,14 @@ async function startServer() {
         });
         return;
       } catch (err: any) {
-        console.warn(`CockroachDB multi-interval insert failed for instance '${selectedInstance?.name}', fallback to offline Cache:`, err.message);
+        console.error(`CockroachDB multi-interval insert failed for instance '${selectedInstance?.name}':`, err.message);
+        res.status(500).json({ error: `Database insert failed: ${err.message}` });
+        return;
       }
     }
 
-    // Fallback Sandbox logic: Append or replace candle in-memory
-    const cacheKey = `${newCandle.pair}-${newCandle.interval}`;
-    const collection = getCachedCandles(newCandle.pair, newCandle.interval);
-
-    const existingIndex = collection.findIndex(c => c.timestamp === newCandle.timestamp);
-    newCandle.id = `m-manual-${Date.now()}`;
-    if (existingIndex !== -1) {
-      collection[existingIndex] = newCandle;
-    } else {
-      collection.push(newCandle);
-      collection.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-    }
-
-    mockCandlesCache[cacheKey] = collection;
-
-    res.json({
-      source: "sandbox",
-      data: newCandle
+    res.status(400).json({
+      error: `No database connection is available for pair '${newCandle.pair}' or interval '${newCandle.interval}'. Please verify that the database connection URLs inside the environment secrets (COCKROACH_DB_URL_1, COCKROACH_DB_URL_2, etc.) are correctly set up.`
     });
   });
 

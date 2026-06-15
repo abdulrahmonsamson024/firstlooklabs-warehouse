@@ -85,6 +85,25 @@ function isCryptoPair(symbol: string): boolean {
   return cryptoBases.some(cb => s.startsWith(cb)) || s.endsWith("USDT") || s.includes("USDT") || s === "BTCUSD" || s === "ETHUSD";
 }
 
+const isAiStudioSandbox = (): boolean => {
+  try {
+    if (window.self !== window.top) {
+      return true;
+    }
+    const hostname = window.location.hostname;
+    if (
+      hostname.includes("ais-dev-") ||
+      hostname === "localhost" ||
+      hostname === "127.0.0.1"
+    ) {
+      return true;
+    }
+  } catch (e) {
+    return true;
+  }
+  return false;
+};
+
 export default function App() {
   // Site Authentication Gated Portal Session State
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
@@ -990,6 +1009,12 @@ export default function App() {
 
   // Check saved passkey session on mount
   useEffect(() => {
+    if (!isAiStudioSandbox()) {
+      localStorage.removeItem("forex_site_secret");
+      setIsVerifyingSession(false);
+      return;
+    }
+
     const savedSecret = localStorage.getItem("forex_site_secret");
     if (savedSecret) {
       fetch("/api/auth/verify", {
@@ -1487,7 +1512,12 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data && data.success) {
-          localStorage.setItem("forex_site_secret", enteredPasscode);
+          (window as any).sandbox_forex_secret = enteredPasscode;
+          if (isAiStudioSandbox()) {
+            localStorage.setItem("forex_site_secret", enteredPasscode);
+          } else {
+            localStorage.removeItem("forex_site_secret");
+          }
           setIsAuthenticated(true);
         } else {
           setAuthError("🔒 ACCESS DENIED: Incorrect administrative secret key.");
