@@ -9046,13 +9046,40 @@ async function startServer() {
             const hasData = parseInt(sizeCheck.rows[0]?.count || "0", 10) > 0;
             
             if (hasData) {
-              // Scan existing months from partitioned schema table
+              // Dynamically assess current and previous months to always pull latest live feed entries
+              const nowTime = new Date();
+              const currentYearStr = nowTime.getUTCFullYear();
+              const currentMonthStr = String(nowTime.getUTCMonth() + 1).padStart(2, '0');
+              const currentMonthKey = `${currentYearStr}-${currentMonthStr}`;
+
+              const prevMonthDate = new Date(Date.UTC(nowTime.getUTCFullYear(), nowTime.getUTCMonth() - 1, 1));
+              const prevYearStr = prevMonthDate.getUTCFullYear();
+              const prevMonthStr = String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0');
+              const prevMonthKey = `${prevYearStr}-${prevMonthStr}`;
+
+              // Scan existing months from partitioned schema table with aggregate count
               const monthsRes = await pool.query(`
-                SELECT DISTINCT TO_CHAR(timestamp, 'YYYY-MM') as yyyy_mm
+                SELECT TO_CHAR(timestamp, 'YYYY-MM') as yyyy_mm, COUNT(*)::INTEGER as row_count
                 FROM public.${m1Table}
+                GROUP BY TO_CHAR(timestamp, 'YYYY-MM')
               `);
               for (const r of monthsRes.rows) {
-                if (r.yyyy_mm) existingMonths.add(r.yyyy_mm);
+                if (r.yyyy_mm) {
+                  const key = r.yyyy_mm;
+                  const rowCount = r.row_count || 0;
+                  
+                  // A month is fully complete if it is not the current/previous month and has minimum complete candles (approx 20,000)
+                  const isCurrent = (key === currentMonthKey);
+                  const isPrev = (key === prevMonthKey);
+                  let minRequiredCandles = 20000;
+                  if (key === "2015-08") minRequiredCandles = 10000; // August 2015 starts mid-month
+                  
+                  if (!isCurrent && !isPrev && rowCount >= minRequiredCandles) {
+                    existingMonths.add(key);
+                  } else {
+                    log(`[Database Scan] Month ${key} marked for update evaluation (current rows count: ${rowCount}).`);
+                  }
+                }
               }
               
               // Scan existing ISO weeks from partitioned schema table
