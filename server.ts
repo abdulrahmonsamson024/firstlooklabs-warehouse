@@ -1876,7 +1876,302 @@ interface ApiLog {
 // API Logs initialized empty - populated by real requests via logging middleware
 const apiLogs: ApiLog[] = [];
 
+let persistentStats = {
+  lifetimeRequests: 0,
+  todayRequests: 0,
+  weekRequests: 0,
+  monthRequests: 0,
+  unauthorizedRequests: 0,
+  secretsUsedRequests: 0,
+  totalLatencyMs: 0,
+  dailyTrends: {} as Record<string, number>,
+  weekdayTrends: Array(7).fill(0),
+  hourlyTrends: Array(24).fill(0),
+  topPairs: {} as Record<string, number>,
+  topTimeframes: {} as Record<string, number>,
+  sources: {} as Record<string, number>,
+  endpoints: {} as Record<string, number>,
+  statusCodes: {} as Record<string, number>,
+  lastDayReset: new Date().toISOString().split("T")[0],
+  lastWeekReset: new Date().toISOString().split("T")[0],
+  lastMonthReset: new Date().toISOString().split("T")[0]
+};
+
+function updatePersistentStats(log: ApiLog) {
+  const now = new Date();
+  const todayStr = now.toISOString().split("T")[0];
+  
+  if (persistentStats.lastDayReset !== todayStr) {
+    persistentStats.todayRequests = 0;
+    persistentStats.lastDayReset = todayStr;
+  }
+  
+  const dow = now.getUTCDay();
+  if (dow === 0 && persistentStats.lastWeekReset !== todayStr) {
+    persistentStats.weekRequests = 0;
+    persistentStats.lastWeekReset = todayStr;
+  }
+  
+  const dom = now.getUTCDate();
+  if (dom === 1 && persistentStats.lastMonthReset !== todayStr) {
+    persistentStats.monthRequests = 0;
+    persistentStats.lastMonthReset = todayStr;
+  }
+
+  persistentStats.lifetimeRequests++;
+  persistentStats.todayRequests++;
+  persistentStats.weekRequests++;
+  persistentStats.monthRequests++;
+  persistentStats.totalLatencyMs += log.latencyMs;
+
+  if (log.statusCode === 401) {
+    persistentStats.unauthorizedRequests++;
+  }
+  if (log.secretUsed) {
+    persistentStats.secretsUsedRequests++;
+  }
+
+  persistentStats.dailyTrends[todayStr] = (persistentStats.dailyTrends[todayStr] || 0) + 1;
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  for (const date in persistentStats.dailyTrends) {
+    if (date < thirtyDaysAgo) {
+      delete persistentStats.dailyTrends[date];
+    }
+  }
+
+  persistentStats.weekdayTrends[dow] = (persistentStats.weekdayTrends[dow] || 0) + 1;
+  
+  const hour = now.getUTCHours();
+  persistentStats.hourlyTrends[hour] = (persistentStats.hourlyTrends[hour] || 0) + 1;
+
+  if (log.symbol) {
+    const sym = log.symbol.toUpperCase();
+    persistentStats.topPairs[sym] = (persistentStats.topPairs[sym] || 0) + 1;
+  }
+  if (log.timeframe) {
+    const tf = log.timeframe.toUpperCase();
+    persistentStats.topTimeframes[tf] = (persistentStats.topTimeframes[tf] || 0) + 1;
+  }
+  if (log.source) {
+    const src = log.source.toLowerCase();
+    persistentStats.sources[src] = (persistentStats.sources[src] || 0) + 1;
+  }
+  
+  const endpoint = log.endpoint;
+  persistentStats.endpoints[endpoint] = (persistentStats.endpoints[endpoint] || 0) + 1;
+  
+  const status = String(log.statusCode);
+  persistentStats.statusCodes[status] = (persistentStats.statusCodes[status] || 0) + 1;
+}
+
+async function savePersistentStatsToDb() {
+  const queryStr = `
+    INSERT INTO public.api_stats_summary (id, stats_json, updated_at)
+    VALUES ('global_api_stats', $1, NOW())
+    ON CONFLICT (id) DO UPDATE
+    SET stats_json = EXCLUDED.stats_json, updated_at = NOW();
+  `;
+  const params = [JSON.stringify(persistentStats)];
+
+  try {
+    const sPool = getSupabasePgPool();
+    if (sPool) {
+      await sPool.query(queryStr, params);
+      return;
+    }
+  } catch (err) {
+    // Fail silently
+  }
+
+  try {
+    if (cockroachInstances.length > 0) {
+      const crPool = getPoolForInstance(cockroachInstances[0].id);
+      if (crPool) {
+        await crPool.query(queryStr, params);
+      }
+    }
+  } catch (err) {
+    // Fail silently
+  }
+}
+
+async function loadPersistentStatsFromDb() {
+  const queryStr = `SELECT stats_json FROM public.api_stats_summary WHERE id = 'global_api_stats'`;
+  let statsRow: any = null;
+
+  try {
+    const sPool = getSupabasePgPool();
+    if (sPool) {
+      const res = await sPool.query(queryStr);
+      if (res.rows.length > 0) {
+        statsRow = res.rows[0];
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  if (!statsRow && cockroachInstances.length > 0) {
+    try {
+      const crPool = getPoolForInstance(cockroachInstances[0].id);
+      if (crPool) {
+        const res = await crPool.query(queryStr);
+        if (res.rows.length > 0) {
+          statsRow = res.rows[0];
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  if (statsRow) {
+    try {
+      const loaded = typeof statsRow.stats_json === 'string' ? JSON.parse(statsRow.stats_json) : statsRow.stats_json;
+      persistentStats = { ...persistentStats, ...loaded };
+      console.log("[API Stats Summary] Loaded persistent aggregated stats successfully from database.");
+      return;
+    } catch (err) {
+      console.warn("[API Stats Summary] Failed to parse stats JSON, using defaults:", err);
+    }
+  }
+
+  console.log("[API Stats Summary] Pre-populating persistent stats from existing api_logs table...");
+  try {
+    const sPool = getSupabasePgPool() || (cockroachInstances.length > 0 ? getPoolForInstance(cockroachInstances[0].id) : null);
+    if (sPool) {
+      await sPool.query(`
+        CREATE TABLE IF NOT EXISTS public.api_stats_summary (
+          id VARCHAR(50) PRIMARY KEY,
+          stats_json JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+      `);
+
+      const statsRes = await sPool.query(`
+        SELECT 
+          COUNT(*) as lifetime,
+          COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '1 day' THEN 1 END) as today,
+          COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '7 days' THEN 1 END) as week,
+          COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '30 days' THEN 1 END) as month,
+          COUNT(CASE WHEN status_code = 401 THEN 1 END) as unauthorized,
+          COUNT(CASE WHEN secret_used = TRUE THEN 1 END) as secrets_used,
+          SUM(latency_ms) as total_latency
+        FROM public.api_logs
+      `);
+
+      if (statsRes.rows.length > 0) {
+        const row = statsRes.rows[0];
+        persistentStats.lifetimeRequests = parseInt(row.lifetime, 10) || 0;
+        persistentStats.todayRequests = parseInt(row.today, 10) || 0;
+        persistentStats.weekRequests = parseInt(row.week, 10) || 0;
+        persistentStats.monthRequests = parseInt(row.month, 10) || 0;
+        persistentStats.unauthorizedRequests = parseInt(row.unauthorized, 10) || 0;
+        persistentStats.secretsUsedRequests = parseInt(row.secrets_used, 10) || 0;
+        persistentStats.totalLatencyMs = parseInt(row.total_latency, 10) || 0;
+      }
+
+      const trendsRes = await sPool.query(`
+        SELECT TO_CHAR(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD') as "day_dt", COUNT(*) as "cnt"
+        FROM public.api_logs
+        WHERE timestamp >= NOW() - INTERVAL '30 days'
+        GROUP BY TO_CHAR(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD')
+        ORDER BY "day_dt" ASC
+      `);
+      trendsRes.rows.forEach((row: any) => {
+        persistentStats.dailyTrends[row.day_dt] = parseInt(row.cnt, 10) || 0;
+      });
+
+      const weekdayRes = await sPool.query(`
+        SELECT EXTRACT(DOW FROM timestamp AT TIME ZONE 'UTC') as "dow", COUNT(*) as "cnt"
+        FROM public.api_logs
+        GROUP BY EXTRACT(DOW FROM timestamp AT TIME ZONE 'UTC')
+      `);
+      weekdayRes.rows.forEach((row: any) => {
+        const dow = Math.floor(parseFloat(row.dow));
+        if (dow >= 0 && dow < 7) {
+          persistentStats.weekdayTrends[dow] = parseInt(row.cnt, 10) || 0;
+        }
+      });
+
+      const hourlyRes = await sPool.query(`
+        SELECT EXTRACT(HOUR FROM timestamp AT TIME ZONE 'UTC') as "hr", COUNT(*) as "cnt"
+        FROM public.api_logs
+        GROUP BY EXTRACT(HOUR FROM timestamp AT TIME ZONE 'UTC')
+      `);
+      hourlyRes.rows.forEach((row: any) => {
+        const hr = Math.floor(parseFloat(row.hr));
+        if (hr >= 0 && hr < 24) {
+          persistentStats.hourlyTrends[hr] = parseInt(row.cnt, 10) || 0;
+        }
+      });
+
+      const pairsRes = await sPool.query(`
+        SELECT UPPER(symbol) as "pair", COUNT(*) as "count"
+        FROM public.api_logs
+        WHERE symbol IS NOT NULL AND symbol != ''
+        GROUP BY UPPER(symbol)
+      `);
+      pairsRes.rows.forEach((row: any) => {
+        persistentStats.topPairs[row.pair] = parseInt(row.count, 10) || 0;
+      });
+
+      const tfRes = await sPool.query(`
+        SELECT UPPER(timeframe) as "tf", COUNT(*) as "count"
+        FROM public.api_logs
+        WHERE timeframe IS NOT NULL AND timeframe != ''
+        GROUP BY UPPER(timeframe)
+      `);
+      tfRes.rows.forEach((row: any) => {
+        persistentStats.topTimeframes[row.tf] = parseInt(row.count, 10) || 0;
+      });
+
+      const srcRes = await sPool.query(`
+        SELECT LOWER(source) as "source", COUNT(*) as "cnt"
+        FROM public.api_logs
+        WHERE source IS NOT NULL AND source != ''
+        GROUP BY LOWER(source)
+      `);
+      srcRes.rows.forEach((row: any) => {
+        persistentStats.sources[row.source] = parseInt(row.cnt, 10) || 0;
+      });
+
+      const epRes = await sPool.query(`
+        SELECT endpoint, COUNT(*) as "cnt"
+        FROM public.api_logs
+        GROUP BY endpoint
+      `);
+      epRes.rows.forEach((row: any) => {
+        persistentStats.endpoints[row.endpoint] = parseInt(row.cnt, 10) || 0;
+      });
+
+      const scRes = await sPool.query(`
+        SELECT status_code, COUNT(*) as "cnt"
+        FROM public.api_logs
+        GROUP BY status_code
+      `);
+      scRes.rows.forEach((row: any) => {
+        persistentStats.statusCodes[String(row.status_code)] = parseInt(row.cnt, 10) || 0;
+      });
+
+      await sPool.query(`
+        INSERT INTO public.api_stats_summary (id, stats_json, updated_at)
+        VALUES ('global_api_stats', $1, NOW())
+        ON CONFLICT (id) DO UPDATE SET stats_json = EXCLUDED.stats_json, updated_at = NOW();
+      `, [JSON.stringify(persistentStats)]);
+      
+      console.log("[API Stats Summary] Pre-seeded summary table from historical logs successfully!");
+    }
+  } catch (err: any) {
+    console.warn("[API Stats Summary] Failed to pre-seed from api_logs:", err.message);
+  }
+}
+
 async function saveApiLogToDb(log: ApiLog) {
+  // Update in-memory and DB persistent aggregated stats
+  updatePersistentStats(log);
+  savePersistentStatsToDb().catch(() => {});
+
   // 1. Try Supabase Postgres Pool if available
   try {
     const sPool = getSupabasePgPool();
@@ -1889,6 +2184,17 @@ async function saveApiLogToDb(log: ApiLog) {
         log.timestamp, log.endpoint, log.method, log.symbol || null, log.source || null, log.timeframe || null,
         log.statusCode, log.latencyMs, log.clientIp, log.secretUsed, log.errorMessage || null
       ]);
+
+      // Prune old logs to keep only the 50 most recent detailed requests
+      await sPool.query(`
+        DELETE FROM public.api_logs 
+        WHERE id NOT IN (
+          SELECT id FROM public.api_logs 
+          ORDER BY timestamp DESC 
+          LIMIT 50
+        )
+      `).catch(() => {});
+
       return;
     }
   } catch (err: any) {
@@ -1908,6 +2214,16 @@ async function saveApiLogToDb(log: ApiLog) {
           log.timestamp, log.endpoint, log.method, log.symbol || null, log.source || null, log.timeframe || null,
           log.statusCode, log.latencyMs, log.clientIp, log.secretUsed, log.errorMessage || null
         ]);
+
+        // Prune old logs to keep only the 50 most recent detailed requests
+        await crPool.query(`
+          DELETE FROM public.api_logs 
+          WHERE id NOT IN (
+            SELECT id FROM public.api_logs 
+            ORDER BY timestamp DESC 
+            LIMIT 50
+          )
+        `).catch(() => {});
       }
     }
   } catch (err: any) {
@@ -1924,7 +2240,7 @@ async function loadApiLogsFromDb() {
         SELECT timestamp, endpoint, method, symbol, source, timeframe, status_code AS "statusCode", latency_ms AS "latencyMs", client_ip AS "clientIp", secret_used AS "secretUsed", error_message AS "errorMessage"
         FROM public.api_logs
         ORDER BY timestamp DESC
-        LIMIT 3000
+        LIMIT 50
       `);
       if (res.rows.length > 0) {
         apiLogs.length = 0;
@@ -1959,7 +2275,7 @@ async function loadApiLogsFromDb() {
           SELECT timestamp, endpoint, method, symbol, source, timeframe, status_code AS "statusCode", latency_ms AS "latencyMs", client_ip AS "clientIp", secret_used AS "secretUsed", error_message AS "errorMessage"
           FROM public.api_logs
           ORDER BY timestamp DESC
-          LIMIT 3000
+          LIMIT 50
         `);
         if (res.rows.length > 0) {
           apiLogs.length = 0;
@@ -2098,107 +2414,12 @@ async function startServer() {
   app.get("/api/admin/api-stats", async (req: Request, res: Response) => {
     const now = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
-    const sevenDaysMs = 7 * oneDayMs;
-    const thirtyDaysMs = 30 * oneDayMs;
 
     const dailyTrendMap = new Map<string, number>();
     for (let i = 29; i >= 0; i--) {
       const d = new Date(now - i * oneDayMs);
       const dateStr = d.toISOString().split("T")[0];
-      dailyTrendMap.set(dateStr, 0);
-    }
-
-    // Start dates in UTC for today, this week, and this month
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const todayStartMs = todayStart.getTime();
-
-    const weekStart = new Date();
-    weekStart.setUTCHours(0, 0, 0, 0);
-    const dayOfWeek = weekStart.getUTCDay(); // 0 = Sunday, 1 = Monday ...
-    // Using Sunday as standard start of the week
-    weekStart.setUTCDate(weekStart.getUTCDate() - dayOfWeek);
-    const weekStartMs = weekStart.getTime();
-
-    const monthStart = new Date();
-    monthStart.setUTCHours(0, 0, 0, 0);
-    monthStart.setUTCDate(1);
-    const monthStartMs = monthStart.getTime();
-
-    // UTC standard calendar-based filtering of local memory list
-    const logsToday = apiLogs.filter(l => new Date(l.timestamp).getTime() >= todayStartMs);
-    const logsWeek = apiLogs.filter(l => new Date(l.timestamp).getTime() >= weekStartMs);
-    const logsMonth = apiLogs.filter(l => new Date(l.timestamp).getTime() >= monthStartMs);
-
-    let lifetimeRequests = apiLogs.length;
-    let todayRequests = logsToday.length;
-    let weekRequests = logsWeek.length;
-    let monthRequests = logsMonth.length;
-    let unauthorizedCount = apiLogs.filter(l => l.statusCode === 401).length;
-    let secretsUsedCount = apiLogs.filter(l => l.secretUsed).length;
-    let totalLatency = apiLogs.reduce((sum, l) => sum + l.latencyMs, 0);
-
-    const sPool = getSupabasePgPool();
-    const crPool = cockroachInstances.length > 0 ? getPoolForInstance(cockroachInstances[0].id) : null;
-    const activePool = sPool || crPool;
-
-    if (activePool) {
-      try {
-        // Query counts and aggregation with single-query efficiency to not exhaust db
-        const statsRes = await withTimeout(activePool.query(`
-          SELECT 
-            COUNT(*) as "lifetime",
-            COUNT(*) FILTER (WHERE timestamp >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')) as "today",
-            COUNT(*) FILTER (WHERE timestamp >= (DATE_TRUNC('week', (NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day') - INTERVAL '1 day')) as "week",
-            COUNT(*) FILTER (WHERE timestamp >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')) as "month",
-            COUNT(*) FILTER (WHERE status_code = 401) as "unauthorized",
-            COUNT(*) FILTER (WHERE secret_used = true) as "secrets_used",
-            COALESCE(SUM(latency_ms), 0) as "total_latency"
-          FROM public.api_logs
-        `), 15000, "timeout exceeded when trying to connect");
-        
-        if (statsRes.rows.length > 0) {
-          const row = statsRes.rows[0];
-          lifetimeRequests = Math.max(lifetimeRequests, parseInt(row.lifetime, 10) || 0);
-          todayRequests = Math.max(todayRequests, parseInt(row.today, 10) || 0);
-          weekRequests = Math.max(weekRequests, parseInt(row.week, 10) || 0);
-          monthRequests = Math.max(monthRequests, parseInt(row.month, 10) || 0);
-          unauthorizedCount = Math.max(unauthorizedCount, parseInt(row.unauthorized, 10) || 0);
-          secretsUsedCount = Math.max(secretsUsedCount, parseInt(row.secrets_used, 10) || 0);
-          totalLatency = Math.max(totalLatency, parseInt(row.total_latency, 10) || 0);
-        }
-
-        // Query daily trends
-        const trendsRes = await withTimeout(activePool.query(`
-          SELECT DATE(timestamp) as "day_dt", COUNT(*) as "cnt"
-          FROM public.api_logs
-          WHERE timestamp >= NOW() - INTERVAL '30 days'
-          GROUP BY DATE(timestamp)
-          ORDER BY DATE(timestamp) ASC
-        `), 15000, "Daily trends query timeout");
-        
-        trendsRes.rows.forEach((row: any) => {
-          if (row.day_dt) {
-            const dObj = new Date(row.day_dt);
-            const dateStr = dObj.toISOString().split("T")[0];
-            if (dailyTrendMap.has(dateStr)) {
-              dailyTrendMap.set(dateStr, parseInt(row.cnt, 10) || 0);
-            }
-          }
-        });
-      } catch (dbErr: any) {
-        console.log(`[API Stats Connection Info] Fallback to memory: ${dbErr.message}`);
-      }
-    }
-
-    if (dailyTrendMap.size > 0 && (!activePool || apiLogs.length > 0 && Array.from(dailyTrendMap.values()).every(v => v === 0))) {
-      // populate using memory list fallback if db trends were empty or failed
-      apiLogs.forEach(l => {
-        const dateStr = l.timestamp.split("T")[0];
-        if (dailyTrendMap.has(dateStr)) {
-          dailyTrendMap.set(dateStr, (dailyTrendMap.get(dateStr) || 0) + 1);
-        }
-      });
+      dailyTrendMap.set(dateStr, persistentStats.dailyTrends[dateStr] || 0);
     }
 
     const dailyTrends = Array.from(dailyTrendMap.entries()).map(([date, count]) => ({
@@ -2206,96 +2427,125 @@ async function startServer() {
       count
     })).sort((a, b) => a.date.localeCompare(b.date));
 
-    // Custom granular distributions calculated directly from memory list (up to 5000 records of latest traffic)
     const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const weekdayCounts = [0, 0, 0, 0, 0, 0, 0];
-    const hourlyCounts = Array(24).fill(0);
-    const pairCountsMap = new Map<string, number>();
-    const timeframeCountsMap = new Map<string, number>();
-
-    const endpointBreakdown: Record<string, number> = {};
-    const statusBreakdown: Record<string, number> = {};
-    const symbolBreakdown: Record<string, number> = {};
-    const sourceBreakdown: Record<string, number> = {};
-
-    apiLogs.forEach(l => {
-      endpointBreakdown[l.endpoint] = (endpointBreakdown[l.endpoint] || 0) + 1;
-      statusBreakdown[l.statusCode] = (statusBreakdown[l.statusCode] || 0) + 1;
-      
-      const d = new Date(l.timestamp);
-      if (!isNaN(d.getTime())) {
-        const utcDay = d.getUTCDay();
-        weekdayCounts[utcDay]++;
-        
-        const utcHour = d.getUTCHours();
-        hourlyCounts[utcHour]++;
-      }
-
-      if (l.symbol) {
-        const sym = l.symbol.toUpperCase();
-        symbolBreakdown[sym] = (symbolBreakdown[sym] || 0) + 1;
-        pairCountsMap.set(sym, (pairCountsMap.get(sym) || 0) + 1);
-      }
-      if (l.source) {
-        const src = l.source.toLowerCase();
-        sourceBreakdown[src] = (sourceBreakdown[src] || 0) + 1;
-      }
-      if (l.timeframe) {
-        const tf = l.timeframe.toUpperCase();
-        timeframeCountsMap.set(tf, (timeframeCountsMap.get(tf) || 0) + 1);
-      }
-    });
-
-    const topPairs = Array.from(pairCountsMap.entries())
-      .map(([pair, count]) => ({ pair, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10);
-
-    const topTimeframes = Array.from(timeframeCountsMap.entries())
-      .map(([timeframe, count]) => ({ timeframe, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10);
-
     const weekdayTrends = weekdayNames.map((name, index) => ({
       day: name,
-      count: weekdayCounts[index]
+      count: persistentStats.weekdayTrends[index] || 0
     }));
 
     const hourlyTrends = Array.from({ length: 24 }, (_, i) => ({
       hour: i,
       label: `${String(i).padStart(2, "0")}:00`,
-      count: hourlyCounts[i]
+      count: persistentStats.hourlyTrends[i] || 0
     }));
 
-    const averageLatencyMs = apiLogs.length > 0 ? Math.round(totalLatency / apiLogs.length) : (activePool ? Math.round(totalLatency / (lifetimeRequests || 1)) : 0);
-    const totalRequests = lifetimeRequests;
+    const topPairs = Object.entries(persistentStats.topPairs)
+      .map(([pair, count]) => ({ pair, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
 
-    const distinctDaysObserved = new Set(apiLogs.map(l => l.timestamp.split("T")[0])).size || 1;
-    const averageRequestsPerDay = distinctDaysObserved > 0 ? Math.round(totalRequests / distinctDaysObserved) : totalRequests;
+    const topTimeframes = Object.entries(persistentStats.topTimeframes)
+      .map(([timeframe, count]) => ({ timeframe, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    const totalRequests = persistentStats.lifetimeRequests;
+    const averageLatencyMs = totalRequests > 0 ? Math.round(persistentStats.totalLatencyMs / totalRequests) : 0;
+    const daysObserved = Math.max(1, Object.keys(persistentStats.dailyTrends).length);
+    const averageRequestsPerDay = Math.round(totalRequests / daysObserved);
 
     const recentLogs = [...apiLogs].reverse().slice(0, 35);
 
     res.json({
       lifetimeRequests: totalRequests,
-      todayRequests,
-      weekRequests,
-      monthRequests,
+      todayRequests: persistentStats.todayRequests,
+      weekRequests: persistentStats.weekRequests,
+      monthRequests: persistentStats.monthRequests,
       averageRequestsPerDay,
       averageLatencyMs,
-      unauthorizedRequests: unauthorizedCount,
-      secretKeysAuthorizedRatio: totalRequests > 0 ? parseFloat((secretsUsedCount / totalRequests * 100).toFixed(1)) : 0,
+      unauthorizedRequests: persistentStats.unauthorizedRequests,
+      secretKeysAuthorizedRatio: totalRequests > 0 ? parseFloat(((persistentStats.secretsUsedRequests / totalRequests) * 100).toFixed(1)) : 0,
       dailyTrends,
       distributions: {
-        endpoints: endpointBreakdown,
-        statusCodes: statusBreakdown,
-        symbols: symbolBreakdown,
-        sources: sourceBreakdown
+        endpoints: persistentStats.endpoints,
+        statusCodes: persistentStats.statusCodes,
+        symbols: persistentStats.topPairs,
+        sources: persistentStats.sources
       },
       topPairs,
       topTimeframes,
       weekdayTrends,
       hourlyTrends,
       recentLogs
+    });
+  });
+
+  // Securely Wipe all API statistics and detailed logs
+  app.post("/api/admin/api-stats/wipe", async (req: Request, res: Response) => {
+    const providedSecret = req.body.secret || req.headers["x-wipe-secret"] || req.query.secret;
+    const wipeSecret = cleanEnvValue(process.env.DB_WIPE_SECRET_KEY);
+    const forexSecret = cleanEnvValue(process.env.FOREX_API_SECRET);
+
+    if (!providedSecret || ((!wipeSecret || providedSecret !== wipeSecret) && (!forexSecret || providedSecret !== forexSecret))) {
+      res.status(403).json({ success: false, error: "Incorrect or missing administration authorization secret key." });
+      return;
+    }
+
+    // Reset local/cache structures
+    apiLogs.length = 0;
+    persistentStats = {
+      lifetimeRequests: 0,
+      todayRequests: 0,
+      weekRequests: 0,
+      monthRequests: 0,
+      unauthorizedRequests: 0,
+      secretsUsedRequests: 0,
+      totalLatencyMs: 0,
+      dailyTrends: {},
+      weekdayTrends: Array(7).fill(0),
+      hourlyTrends: Array(24).fill(0),
+      topPairs: {},
+      topTimeframes: {},
+      sources: {},
+      endpoints: {},
+      statusCodes: {},
+      lastDayReset: new Date().toISOString().split("T")[0],
+      lastWeekReset: new Date().toISOString().split("T")[0],
+      lastMonthReset: new Date().toISOString().split("T")[0]
+    };
+
+    let supabaseWiped = false;
+    let cockroachWiped = false;
+
+    try {
+      const sPool = getSupabasePgPool();
+      if (sPool) {
+        await sPool.query("DELETE FROM public.api_logs;");
+        await sPool.query("DELETE FROM public.api_stats_summary;");
+        supabaseWiped = true;
+      }
+    } catch (err: any) {
+      console.error("[Wipe Stats] Supabase wipe error:", err.message);
+    }
+
+    try {
+      if (cockroachInstances.length > 0) {
+        const crPool = getPoolForInstance(cockroachInstances[0].id);
+        if (crPool) {
+          await crPool.query("DELETE FROM public.api_logs;");
+          await crPool.query("DELETE FROM public.api_stats_summary;");
+          cockroachWiped = true;
+        }
+      }
+    } catch (err: any) {
+      console.error("[Wipe Stats] CockroachDB wipe error:", err.message);
+    }
+
+    res.json({
+      success: true,
+      message: "Successfully wiped all API stats summaries and detailed request logs.",
+      supabaseWiped,
+      cockroachWiped
     });
   });
 
@@ -2324,7 +2574,9 @@ async function startServer() {
 
   // Preseed in-memory API logs cache from persistent storage once databases are checked/created
   setTimeout(() => {
-    loadApiLogsFromDb().catch(err => {
+    loadPersistentStatsFromDb().then(() => {
+      return loadApiLogsFromDb();
+    }).catch(err => {
       console.warn("[API Logs] Boot-time preseed failed:", err.message);
     });
   }, 1000);
@@ -3175,6 +3427,102 @@ async function startServer() {
     } catch (err: any) {
       console.error("[AdminBulkDelete] Failed proxying bulk-delete:", err);
       return res.status(500).json({ error: `Connection failed: ${err.message}` });
+    }
+  });
+
+  // 3.4 User Activity Statistics (GET /api/admin/users/activity-stats)
+  app.get("/api/admin/users/activity-stats", async (req: Request, res: Response) => {
+    const authHeader = req.headers.authorization;
+    let providedSecret = "";
+    if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
+      providedSecret = authHeader.substring(7).trim();
+    } else if (req.headers["x-api-secret"]) {
+      providedSecret = String(req.headers["x-api-secret"]).trim();
+    } else if (req.query.secret) {
+      providedSecret = String(req.query.secret).trim();
+    }
+
+    const wipeSecret = cleanEnvValue(process.env.DB_WIPE_SECRET_KEY);
+    const forexSecret = cleanEnvValue(process.env.FOREX_API_SECRET);
+
+    if (!providedSecret || ((!wipeSecret || providedSecret !== wipeSecret) && (!forexSecret || providedSecret !== forexSecret))) {
+      return res.status(401).json({ error: "Unauthorized: Invalid or missing administrative authorization token." });
+    }
+
+    let adminApiUrl = process.env.ADMIN_API_URL ? process.env.ADMIN_API_URL.trim() : "";
+    if (adminApiUrl.startsWith('"') || adminApiUrl.startsWith("'")) {
+      adminApiUrl = adminApiUrl.replace(/^['"]|['"]$/g, "").trim();
+    }
+
+    if (!adminApiUrl) {
+      return res.json({
+        avgDailyUsers: 0,
+        avgWeeklyUsers: 0,
+        avgMonthlyUsers: 0,
+        avgYearlyUsers: 0,
+        totalLogs: 0
+      });
+    }
+
+    // Normalize URL
+    try {
+      if (adminApiUrl) {
+        const parsedUrl = new URL(adminApiUrl);
+        if (parsedUrl.pathname === "/" || parsedUrl.pathname === "") {
+          adminApiUrl = parsedUrl.origin + "/api/admin";
+        } else if (!parsedUrl.pathname.includes("/admin")) {
+          if (parsedUrl.pathname.endsWith("/api")) {
+            adminApiUrl = adminApiUrl.replace(/\/+$/, "") + "/admin";
+          } else {
+            adminApiUrl = adminApiUrl.replace(/\/+$/, "") + "/api/admin";
+          }
+        }
+      }
+    } catch {
+      if (adminApiUrl.startsWith("http")) {
+        if (!adminApiUrl.includes("/api/admin") && !adminApiUrl.includes("/admin")) {
+          adminApiUrl = adminApiUrl.replace(/\/+$/, "") + "/api/admin";
+        }
+      }
+    }
+
+    const cleanBaseUrl = adminApiUrl.endsWith("/") ? adminApiUrl.slice(0, -1) : adminApiUrl;
+    const targetUrl = `${cleanBaseUrl}/users/activity-stats`;
+
+    console.log(`[AdminUserActivityStats] Proxying activity stats request to target url: ${targetUrl}`);
+
+    try {
+      const remoteRes = await fetch(targetUrl, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${forexSecret}`
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (remoteRes.ok) {
+        const data = await remoteRes.json();
+        return res.json(data);
+      } else {
+        console.warn(`[AdminUserActivityStats] Remote server returned status ${remoteRes.status}. Returning zero-zero values...`);
+        return res.json({
+          avgDailyUsers: 0,
+          avgWeeklyUsers: 0,
+          avgMonthlyUsers: 0,
+          avgYearlyUsers: 0,
+          totalLogs: 0
+        });
+      }
+    } catch (err: any) {
+      console.warn(`[AdminUserActivityStats] Proxy failed with error: ${err.message}. Returning zero-zero values...`);
+      return res.json({
+        avgDailyUsers: 0,
+        avgWeeklyUsers: 0,
+        avgMonthlyUsers: 0,
+        avgYearlyUsers: 0,
+        totalLogs: 0
+      });
     }
   });
 
@@ -8954,6 +9302,51 @@ async function startServer() {
         
         log(`[DB Write] Uploading metrics to dynamic partitioned tables: [1m: ${candles1m.length}, 5m: ${candles5m.length}, 15m: ${candles15m.length}, 1h: ${candles1h.length}, 4h: ${candles4h.length}, 1d: ${candles1d.length}, 1w: ${candles1w.length}]...`);
         
+        const saveToMemoryOnly = (
+          c1m: Candlestick[],
+          c5m: Candlestick[],
+          c15m: Candlestick[],
+          c1h: Candlestick[],
+          c4h: Candlestick[],
+          c1d: Candlestick[],
+          c1w: Candlestick[],
+          tot: number
+        ) => {
+          const m1Key = `${pair.toUpperCase()}-1m`;
+          const m5Key = `${pair.toUpperCase()}-5m`;
+          const m15Key = `${pair.toUpperCase()}-15m`;
+          const h1Key = `${pair.toUpperCase()}-1h`;
+          const h4Key = `${pair.toUpperCase()}-4h`;
+          const d1Key = `${pair.toUpperCase()}-1d`;
+          const w1Key = `${pair.toUpperCase()}-1w`;
+          
+          const filterAndMerge = (key: string, newCandles: Candlestick[]) => {
+            newCandles.forEach(c => c.source = source.toLowerCase());
+            const existing = mockCandlesCache[key] || [];
+            const customCleaned = existing.filter(c => c.source?.toLowerCase() !== source.toLowerCase());
+            mockCandlesCache[key] = [...customCleaned, ...newCandles];
+          };
+          
+          filterAndMerge(m1Key, c1m);
+          filterAndMerge(m5Key, c5m);
+          filterAndMerge(m15Key, c15m);
+          filterAndMerge(h1Key, c1h);
+          filterAndMerge(h4Key, c4h);
+          filterAndMerge(d1Key, c1d);
+          filterAndMerge(w1Key, c1w);
+          
+          state.totalSaved += tot;
+          state.totalParsed_1m += c1m.length;
+          state.totalParsed_5m += c5m.length;
+          state.totalParsed_15m += c15m.length;
+          state.totalParsed_1h += c1h.length;
+          state.totalParsed_4h += c4h.length;
+          state.totalParsed_1d += c1d.length;
+          state.totalParsed_1w += c1w.length;
+          log(`[DB Write] Mocked ${tot} records in environment RAM memory successfully.`);
+          clearDbStatusCaches();
+        };
+
         if (pool) {
           const sLower = source.toLowerCase();
           const pUpper = pair.toUpperCase();
@@ -8982,44 +9375,19 @@ async function startServer() {
             log(`[DB Write] Successfully wrote chunk of ${total} records to database partition tables.`);
             clearDbStatusCaches();
           } catch (writeErr: any) {
-            log(`[Batch Notice] Skipping db partition chunk writing: ${writeErr.message}`);
-            throw writeErr;
+            log(`[Batch Notice] Skipping db partition chunk writing: ${writeErr.message}. Falling back to in-memory mock storage.`);
+            state.totalParsed_1m -= candles1m.length;
+            state.totalParsed_5m -= candles5m.length;
+            state.totalParsed_15m -= candles15m.length;
+            state.totalParsed_1h -= candles1h.length;
+            state.totalParsed_4h -= candles4h.length;
+            state.totalParsed_1d -= candles1d.length;
+            state.totalParsed_1w -= candles1w.length;
+
+            saveToMemoryOnly(candles1m, candles5m, candles15m, candles1h, candles4h, candles1d, candles1w, total);
           }
         } else {
-          // Dev mock fallback cache
-          const m1Key = `${pair.toUpperCase()}-1m`;
-          const m5Key = `${pair.toUpperCase()}-5m`;
-          const m15Key = `${pair.toUpperCase()}-15m`;
-          const h1Key = `${pair.toUpperCase()}-1h`;
-          const h4Key = `${pair.toUpperCase()}-4h`;
-          const d1Key = `${pair.toUpperCase()}-1d`;
-          const w1Key = `${pair.toUpperCase()}-1w`;
-          
-          const filterAndMerge = (key: string, newCandles: Candlestick[]) => {
-            newCandles.forEach(c => c.source = source.toLowerCase());
-            const existing = mockCandlesCache[key] || [];
-            const customCleaned = existing.filter(c => c.source?.toLowerCase() !== source.toLowerCase());
-            mockCandlesCache[key] = [...customCleaned, ...newCandles];
-          };
-          
-          filterAndMerge(m1Key, candles1m);
-          filterAndMerge(m5Key, candles5m);
-          filterAndMerge(m15Key, candles15m);
-          filterAndMerge(h1Key, candles1h);
-          filterAndMerge(h4Key, candles4h);
-          filterAndMerge(d1Key, candles1d);
-          filterAndMerge(w1Key, candles1w);
-          
-          state.totalSaved += total;
-          state.totalParsed_1m += candles1m.length;
-          state.totalParsed_5m += candles5m.length;
-          state.totalParsed_15m += candles15m.length;
-          state.totalParsed_1h += candles1h.length;
-          state.totalParsed_4h += candles4h.length;
-          state.totalParsed_1d += candles1d.length;
-          state.totalParsed_1w += candles1w.length;
-          log(`[DB Write] Mocked ${total} records in environment RAM memory successfully.`);
-          clearDbStatusCaches();
+          saveToMemoryOnly(candles1m, candles5m, candles15m, candles1h, candles4h, candles1d, candles1w, total);
         }
       };
 
@@ -9143,10 +9511,14 @@ async function startServer() {
             pBase = "USTEC";
           }
           const pairsToTry: string[] = [];
-          if (pBase.endsWith("M")) {
+          const stocksList = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"];
+          if (stocksList.includes(pBase)) {
+            pairsToTry.push(pBase + "m");
+            pairsToTry.push(pBase);
+          } else if (pBase.endsWith("M")) {
             const trimmed = pBase.substring(0, pBase.length - 1);
-            pairsToTry.push(trimmed);
             pairsToTry.push(trimmed + "m");
+            pairsToTry.push(trimmed);
             pairsToTry.push(pBase);
           } else {
             pairsToTry.push(pBase);
@@ -9842,7 +10214,16 @@ async function startServer() {
       "US30",
       "NAS100",
       "SPX500",
-      "DXY"
+      "DXY",
+      "NVDA",
+      "TSLA",
+      "AAPL",
+      "MSFT",
+      "AMZN",
+      "META",
+      "AMD",
+      "GOOGL",
+      "AVGO"
     ];
 
     // Gather all currently active database-pair combinations
@@ -9993,8 +10374,13 @@ async function startServer() {
     }
 
     if (!instance.pairs.some(p => p.toUpperCase() === pairUpper)) {
-      res.status(400).json({ error: `Pair ${pairUpper} is not configured on instance ${instanceId}. Please register the asset pair first.` });
-      return;
+      // Automatically register the pair on this instance!
+      instance.pairs.push(pairUpper);
+      const currentCustom = loadCustomPairsConfig();
+      currentCustom[instance.id] = instance.pairs;
+      saveCustomPairsConfig(currentCustom);
+      clearDbStatusCaches();
+      console.log(`[Ingest Auto-Registration] Registered pair ${pairUpper} on instance ${instanceId} dynamically.`);
     }
 
     const stateKey = `${instanceId}:${pairUpper}:${source.toLowerCase()}`;

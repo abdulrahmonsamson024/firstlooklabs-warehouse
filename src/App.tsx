@@ -132,6 +132,11 @@ export default function App() {
     recentLogs: any[];
   } | null>(null);
   const [isRefreshingApiStats, setIsRefreshingApiStats] = useState(false);
+  const [showWipeStatsDialog, setShowWipeStatsDialog] = useState(false);
+  const [wipeStatsSecret, setWipeStatsSecret] = useState("");
+  const [isWipingStats, setIsWipingStats] = useState(false);
+  const [wipeStatsError, setWipeStatsError] = useState("");
+  const [wipeSuccessMessage, setWipeSuccessMessage] = useState("");
   const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
   const [copiedHealthUrl, setCopiedHealthUrl] = useState(false);
   const [enableTerminalConsoleLogs, setEnableTerminalConsoleLogs] = useState(false);
@@ -333,6 +338,40 @@ export default function App() {
       console.error("Failed to fetch administrative API statistics:", err);
     } finally {
       if (loadingIndicator) setIsRefreshingApiStats(false);
+    }
+  };
+
+  const handleWipeStats = async () => {
+    if (!wipeStatsSecret.trim()) {
+      setWipeStatsError("Please enter your administration API secret key.");
+      return;
+    }
+    setIsWipingStats(true);
+    setWipeStatsError("");
+    setWipeSuccessMessage("");
+    try {
+      const res = await fetch("/api/admin/api-stats/wipe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret: wipeStatsSecret })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setWipeSuccessMessage("API request logs and statistics have been successfully wiped!");
+        setWipeStatsSecret("");
+        fetchApiStats(); // refresh visual dashboard representation
+        setTimeout(() => {
+          setShowWipeStatsDialog(false);
+          setWipeSuccessMessage("");
+        }, 2500);
+      } else {
+        setWipeStatsError(data.error || "Wipe action unauthorized or failed.");
+      }
+    } catch (err: any) {
+      console.error("Wipe stats error:", err);
+      setWipeStatsError("Network or server connection failure: " + err.message);
+    } finally {
+      setIsWipingStats(false);
     }
   };
 
@@ -1889,14 +1928,28 @@ export default function App() {
                       </span>
                     </div>
                   </div>
-                  <button
-                    onClick={() => fetchApiStats(true)}
-                    disabled={isRefreshingApiStats}
-                    className="cursor-pointer bg-[#151921] hover:bg-[#1E232D] border border-[#1E232D] text-xs font-mono text-purple-300 px-3.5 py-2 flex items-center gap-2 transition-all shrink-0 hover:border-purple-500/30 font-medium"
-                  >
-                    <RefreshCw className={`h-3 w-3 ${isRefreshingApiStats ? "animate-spin text-purple-400" : ""}`} />
-                    FORCE REFRESH
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => fetchApiStats(true)}
+                      disabled={isRefreshingApiStats}
+                      className="cursor-pointer bg-[#151921] hover:bg-[#1E232D] border border-[#1E232D] text-xs font-mono text-purple-300 px-3.5 py-2 flex items-center gap-2 transition-all hover:border-purple-500/30 font-medium"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${isRefreshingApiStats ? "animate-spin text-purple-400" : ""}`} />
+                      FORCE REFRESH
+                    </button>
+                    <button
+                      onClick={() => {
+                        setWipeStatsSecret("");
+                        setWipeStatsError("");
+                        setWipeSuccessMessage("");
+                        setShowWipeStatsDialog(true);
+                      }}
+                      className="cursor-pointer bg-red-950/30 hover:bg-red-900/40 border border-red-900/50 hover:border-red-500/50 text-xs font-mono text-red-400 px-3.5 py-2 flex items-center gap-2 transition-all font-medium"
+                    >
+                      <Trash2 className="h-3 w-3 text-red-400" />
+                      WIPE ALL STATS
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -2354,6 +2407,112 @@ export default function App() {
                   <span className="text-slate-400 font-mono uppercase tracking-wider text-xs">Querying administrative telemetry server...</span>
                 </div>
               )}
+
+              {/* Wipe All Stats Confirmation Modal Overlay */}
+              <AnimatePresence>
+                {showWipeStatsDialog && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    {/* Backdrop */}
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      onClick={() => {
+                        if (!isWipingStats) setShowWipeStatsDialog(false);
+                      }}
+                      className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+                    />
+
+                    {/* Modal Container */}
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.95, y: 16 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.95, y: 16 }}
+                      className="relative w-full max-w-md bg-[#0F1218] border border-red-500/30 p-6 font-mono shadow-2xl overflow-hidden"
+                    >
+                      {/* Decorative Red accent line */}
+                      <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-red-600 to-amber-500" />
+
+                      <div className="flex items-start gap-4">
+                        <div className="p-3 bg-red-500/10 text-red-400 border border-red-500/20 shrink-0">
+                          <Trash2 className="h-6 w-6" />
+                        </div>
+                        <div className="space-y-1.5 flex-1">
+                          <h4 className="text-sm font-bold text-white uppercase tracking-wider">
+                            DANGER: WIPE ALL API DATA
+                          </h4>
+                          <p className="text-xs text-slate-400 font-sans leading-relaxed">
+                            This operation will permanently delete all API statistics, summary metrics, and the detailed API request logs in both Supabase and CockroachDB tables. This is irreversible.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-5 space-y-4">
+                        <div>
+                          <label className="block text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">
+                            Enter Administration API Secret Key
+                          </label>
+                          <input
+                            type="password"
+                            value={wipeStatsSecret}
+                            onChange={(e) => {
+                              setWipeStatsSecret(e.target.value);
+                              setWipeStatsError("");
+                            }}
+                            placeholder="••••••••••••••••"
+                            disabled={isWipingStats}
+                            className="w-full bg-[#151921] border border-[#1E232D] text-xs font-mono text-white px-3 py-2.5 focus:border-red-500/50 focus:outline-none transition-all placeholder:text-slate-700"
+                          />
+                        </div>
+
+                        {wipeStatsError && (
+                          <div className="p-3 bg-red-500/10 border border-red-500/20 text-xs text-red-400 font-medium">
+                            {wipeStatsError}
+                          </div>
+                        )}
+
+                        {wipeSuccessMessage && (
+                          <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-400 font-medium">
+                            {wipeSuccessMessage}
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-end gap-2.5 pt-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!isWipingStats) {
+                                setShowWipeStatsDialog(false);
+                                setWipeStatsSecret("");
+                                setWipeStatsError("");
+                              }
+                            }}
+                            disabled={isWipingStats}
+                            className="cursor-pointer bg-[#151921] hover:bg-[#1E232D] border border-[#1E232D] px-4 py-2 text-xs text-slate-400 hover:text-white transition-all"
+                          >
+                            CANCEL
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleWipeStats}
+                            disabled={isWipingStats}
+                            className="cursor-pointer bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 hover:border-red-500/50 px-4 py-2 text-xs text-red-400 font-bold transition-all flex items-center gap-2"
+                          >
+                            {isWipingStats ? (
+                              <>
+                                <RefreshCw className="h-3 w-3 animate-spin" />
+                                WIPING...
+                              </>
+                            ) : (
+                              "CONFIRM WIPE ALL"
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  </div>
+                )}
+              </AnimatePresence>
             </div>
           )}
 
@@ -4031,14 +4190,15 @@ fetch(\`\${endpoint}?\${params}\`)
                                 {[
                                   "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD", "NZDUSD", 
                                   "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURCHF", "EURAUD", "GBPAUD", 
-                                  "XAUUSD", "XAGUSD", "USOIL", "US30", "NAS100", "SPX500", "DXY"
-                                ].map((pair, idx) => (
+                                  "XAUUSD", "XAGUSD", "USOIL", "US30", "NAS100", "SPX500", "DXY",
+                                  "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"
+                                ].map((pair, idx, arr) => (
                                   <div key={pair} className="flex items-center gap-1.5">
                                     <span className="text-[8px] text-slate-600 font-normal">{idx + 1}.</span>
                                     <span className="px-1.5 py-0.5 bg-slate-900 border border-slate-800/60 text-slate-350 tracking-wider">
                                       {pair}
                                     </span>
-                                    {idx < 20 && <span className="text-slate-700">→</span>}
+                                    {idx < arr.length - 1 && <span className="text-slate-700">→</span>}
                                   </div>
                                 ))}
                               </div>
@@ -4084,7 +4244,16 @@ fetch(\`\${endpoint}?\${params}\`)
                                 "US30",
                                 "NAS100",
                                 "SPX500",
-                                "DXY"
+                                "DXY",
+                                "NVDA",
+                                "TSLA",
+                                "AAPL",
+                                "MSFT",
+                                "AMZN",
+                                "META",
+                                "AMD",
+                                "GOOGL",
+                                "AVGO"
                               ].map((pair) => (
                                 <option key={pair} value={pair} className="bg-[#05070A] text-slate-200 font-mono text-[11px]">
                                   {pair}
@@ -4187,7 +4356,8 @@ fetch(\`\${endpoint}?\${params}\`)
                           const orderedPairs = [
                             "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD", "NZDUSD", 
                             "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURCHF", "EURAUD", "GBPAUD", 
-                            "XAUUSD", "XAGUSD", "USOIL", "US30", "NAS100", "SPX500", "DXY"
+                            "XAUUSD", "XAGUSD", "USOIL", "US30", "NAS100", "SPX500", "DXY",
+                            "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"
                           ];
                           
                           let totalTasks = 0;

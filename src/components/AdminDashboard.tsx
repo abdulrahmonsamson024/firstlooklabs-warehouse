@@ -412,6 +412,41 @@ export function AdminDashboard() {
   const [isFetchingWatchlistItemStats, setIsFetchingWatchlistItemStats] = useState<boolean>(false);
   const [statsError, setStatsError] = useState<string | null>(null);
 
+  // User Activity Stats (Collapsible on-demand advanced section)
+  const [isActivityStatsExpanded, setIsActivityStatsExpanded] = useState<boolean>(false);
+  const [activityStats, setActivityStats] = useState<any | null>(null);
+  const [activityStatsLoading, setActivityStatsLoading] = useState<boolean>(false);
+  const [activityStatsError, setActivityStatsError] = useState<string | null>(null);
+
+  const fetchActivityStats = async () => {
+    try {
+      setActivityStatsLoading(true);
+      setActivityStatsError(null);
+      const secret = customLocalStorage.getItem("forex_site_secret") || "";
+      const res = await fetch("/api/admin/users/activity-stats", {
+        headers: {
+          "Authorization": `Bearer ${secret}`
+        }
+      });
+      if (!res.ok) {
+        throw new Error(`Server responded with status ${res.status}`);
+      }
+      const data = await res.json();
+      setActivityStats(data);
+    } catch (err: any) {
+      console.error("Failed to load user activity stats:", err);
+      setActivityStatsError(err.message || "Failed to load user activity stats");
+    } finally {
+      setActivityStatsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isActivityStatsExpanded && !activityStats && !activityStatsLoading) {
+      fetchActivityStats();
+    }
+  }, [isActivityStatsExpanded, activityStats, activityStatsLoading]);
+
   const handleStartEdit = () => {
     if (!selectedUser) return;
     setEditFormName(selectedUser.name || "");
@@ -2209,9 +2244,204 @@ export function AdminDashboard() {
               </div>
             </div>
 
+            {/* Advanced On-Demand User Activity Statistics */}
+            <div className="bg-[#0F1218] border border-[#1E232D] p-5">
+              <button
+                onClick={() => setIsActivityStatsExpanded(!isActivityStatsExpanded)}
+                className="w-full flex items-center justify-between text-left cursor-pointer outline-none group/adv"
+              >
+                <div>
+                  <span className="text-xs font-bold text-white font-mono uppercase tracking-wider flex items-center gap-1.5">
+                    <Activity className={`h-4 w-4 text-cyan-400 ${activityStatsLoading ? "animate-pulse" : ""}`} /> 
+                    Advanced User Activity & Engagement Metrics
+                  </span>
+                  <p className="text-[10px] text-slate-500 font-mono uppercase mt-0.5">
+                    {isActivityStatsExpanded ? "AUDITING INTERACTIVE SESSION DENSITY" : "CLICK TO FETCH COMPREHENSIVE ENGAGEMENT STATISTICS"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  {activityStatsLoading && (
+                    <RefreshCw className="h-3.5 w-3.5 text-cyan-400 animate-spin" />
+                  )}
+                  <div className="bg-[#141822] border border-[#1E232D] p-1.5 text-slate-400 group-hover/adv:text-white group-hover/adv:border-cyan-500/30 transition-all">
+                    {isActivityStatsExpanded ? (
+                      <ChevronRight className="h-4 w-4 transform rotate-90 transition-transform duration-200" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 transition-transform duration-200" />
+                    )}
+                  </div>
+                </div>
+              </button>
 
+              <AnimatePresence initial={false}>
+                {isActivityStatsExpanded && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.25, ease: "easeInOut" }}
+                    className="overflow-hidden"
+                  >
+                    <div className="pt-5 border-t border-[#1E232D]/80 mt-4 space-y-5 font-mono">
+                      {activityStatsLoading && !activityStats ? (
+                        <div className="py-12 text-center text-xs text-slate-500 uppercase tracking-wider animate-pulse">
+                          Synchronizing with administrative telemetry node...
+                        </div>
+                      ) : activityStatsError ? (
+                        <div className="p-4 bg-red-950/20 border border-red-900/40 text-xs text-red-400 flex items-center gap-2.5">
+                          <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
+                          <div className="flex-1">
+                            <span className="font-bold block uppercase tracking-wider mb-0.5">Query Refused</span>
+                            {activityStatsError}
+                          </div>
+                          <button
+                            onClick={fetchActivityStats}
+                            className="px-3 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-300 border border-red-700/30 text-[10px] font-bold uppercase transition"
+                          >
+                            Retry
+                          </button>
+                        </div>
+                      ) : activityStats ? (
+                        <div className="space-y-6">
+                          {/* Grid statistics cards */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                            <div className="bg-[#141822]/60 border border-[#1E232D] p-4 relative overflow-hidden">
+                              <span className="text-[9px] text-slate-500 font-bold tracking-wider block uppercase mb-1">Avg Daily Users</span>
+                              <span className="text-xl font-bold text-white block font-mono">
+                                {activityStats.avgDailyUsers?.toFixed(1) || "0.0"}
+                              </span>
+                              <span className="text-[9px] text-slate-400 mt-1 block uppercase font-mono">
+                                24-Hour Active Density
+                              </span>
+                              <div className="absolute right-0 bottom-0 left-0 h-1 bg-cyan-500/20" />
+                            </div>
 
+                            <div className="bg-[#141822]/60 border border-[#1E232D] p-4 relative overflow-hidden">
+                              <span className="text-[9px] text-slate-500 font-bold tracking-wider block uppercase mb-1">Avg Weekly Users</span>
+                              <span className="text-xl font-bold text-white block font-mono">
+                                {activityStats.avgWeeklyUsers?.toFixed(1) || "0.0"}
+                              </span>
+                              <span className="text-[9px] text-slate-400 mt-1 block uppercase font-mono">
+                                7-Day Rolling Window
+                              </span>
+                              <div className="absolute right-0 bottom-0 left-0 h-1 bg-purple-500/20" />
+                            </div>
 
+                            <div className="bg-[#141822]/60 border border-[#1E232D] p-4 relative overflow-hidden">
+                              <span className="text-[9px] text-slate-500 font-bold tracking-wider block uppercase mb-1">Avg Monthly Users</span>
+                              <span className="text-xl font-bold text-white block font-mono">
+                                {activityStats.avgMonthlyUsers?.toFixed(1) || "0.0"}
+                              </span>
+                              <span className="text-[9px] text-slate-400 mt-1 block uppercase font-mono">
+                                30-Day Cohort Footprint
+                              </span>
+                              <div className="absolute right-0 bottom-0 left-0 h-1 bg-indigo-500/20" />
+                            </div>
+
+                            <div className="bg-[#141822]/60 border border-[#1E232D] p-4 relative overflow-hidden">
+                              <span className="text-[9px] text-slate-500 font-bold tracking-wider block uppercase mb-1">Avg Yearly Users</span>
+                              <span className="text-xl font-bold text-white block font-mono">
+                                {activityStats.avgYearlyUsers?.toFixed(1) || "0.0"}
+                              </span>
+                              <span className="text-[9px] text-slate-400 mt-1 block uppercase font-mono">
+                                Yearly Run-Rate Reach
+                              </span>
+                              <div className="absolute right-0 bottom-0 left-0 h-1 bg-emerald-500/20" />
+                            </div>
+
+                            <div className="bg-[#141822]/60 border border-[#1E232D] p-4 relative overflow-hidden sm:col-span-2 lg:col-span-1">
+                              <span className="text-[9px] text-slate-500 font-bold tracking-wider block uppercase mb-1">Total Logs Count</span>
+                              <span className="text-xl font-bold text-amber-400 block font-mono">
+                                {activityStats.totalLogs?.toLocaleString() || "0"}
+                              </span>
+                              <span className="text-[9px] text-slate-400 mt-1 block uppercase font-mono">
+                                Cumulative Sessions
+                              </span>
+                              <div className="absolute right-0 bottom-0 left-0 h-1 bg-amber-500/20" />
+                            </div>
+                          </div>
+
+                          {/* Visual progress representations */}
+                          <div className="border border-[#1E232D] p-4 bg-[#141822]/20">
+                            <span className="text-[10px] text-slate-300 font-bold tracking-wider block mb-4 uppercase">
+                              Engagement Retention Ratios
+                            </span>
+                            <div className="space-y-4 text-xs font-mono">
+                              <div>
+                                <div className="flex justify-between text-[10px] uppercase text-slate-400 mb-1.5">
+                                  <span>Daily Active / Weekly Active (DAU/WAU Ratio)</span>
+                                  <span className="text-cyan-400 font-bold">
+                                    {activityStats.avgWeeklyUsers > 0 
+                                      ? ((activityStats.avgDailyUsers / activityStats.avgWeeklyUsers) * 100).toFixed(1) 
+                                      : "0.0"}%
+                                  </span>
+                                </div>
+                                <div className="w-full bg-[#141822] border border-[#1E232D] h-2 rounded-none overflow-hidden">
+                                  <div 
+                                    className="bg-cyan-500 h-full transition-all duration-1000"
+                                    style={{ 
+                                      width: `${activityStats.avgWeeklyUsers > 0 
+                                        ? Math.min(100, (activityStats.avgDailyUsers / activityStats.avgWeeklyUsers) * 100) 
+                                        : 0}%` 
+                                    }}
+                                  />
+                                </div>
+                              </div>
+
+                              <div>
+                                <div className="flex justify-between text-[10px] uppercase text-slate-400 mb-1.5">
+                                  <span>Weekly Active / Monthly Active (WAU/MAU Ratio)</span>
+                                  <span className="text-purple-400 font-bold">
+                                    {activityStats.avgMonthlyUsers > 0 
+                                      ? ((activityStats.avgWeeklyUsers / activityStats.avgMonthlyUsers) * 100).toFixed(1) 
+                                      : "0.0"}%
+                                  </span>
+                                </div>
+                                <div className="w-full bg-[#141822] border border-[#1E232D] h-2 rounded-none overflow-hidden">
+                                  <div 
+                                    className="bg-purple-500 h-full transition-all duration-1000"
+                                    style={{ 
+                                      width: `${activityStats.avgMonthlyUsers > 0 
+                                        ? Math.min(100, (activityStats.avgWeeklyUsers / activityStats.avgMonthlyUsers) * 100) 
+                                        : 0}%` 
+                                    }}
+                                  />
+                                </div>
+                              </div>
+
+                              <div>
+                                <div className="flex justify-between text-[10px] uppercase text-slate-400 mb-1.5">
+                                  <span>Monthly Active / Yearly Active (MAU/YAU Ratio)</span>
+                                  <span className="text-indigo-400 font-bold">
+                                    {activityStats.avgYearlyUsers > 0 
+                                      ? ((activityStats.avgMonthlyUsers / activityStats.avgYearlyUsers) * 100).toFixed(1) 
+                                      : "0.0"}%
+                                  </span>
+                                </div>
+                                <div className="w-full bg-[#141822] border border-[#1E232D] h-2 rounded-none overflow-hidden">
+                                  <div 
+                                    className="bg-indigo-500 h-full transition-all duration-1000"
+                                    style={{ 
+                                      width: `${activityStats.avgYearlyUsers > 0 
+                                        ? Math.min(100, (activityStats.avgMonthlyUsers / activityStats.avgYearlyUsers) * 100) 
+                                        : 0}%` 
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="py-8 text-center text-xs text-slate-500 uppercase tracking-wider">
+                          Ready to fetch engagement data. Click to expand.
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
 
           </div>
         )}
