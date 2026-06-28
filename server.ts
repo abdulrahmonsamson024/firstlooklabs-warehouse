@@ -6715,7 +6715,7 @@ async function startServer() {
 
   // 4. Fetch Multi-Interval Candlesticks (Real CockroachDB + Fallback Sandbox)
   app.get("/api/candles", async (req: Request, res: Response) => {
-    const pair = (req.query.pair as string) || "BTCUSD";
+    const pair = (req.query.pair as string || req.query.symbol as string || "BTCUSD");
     const interval = (req.query.interval as MarketInterval) || "1h";
     const instanceId = req.query.instanceId as string;
     const startTime = req.query.startTime as string;
@@ -6796,10 +6796,15 @@ async function startServer() {
       pool = getPoolForInstance(instanceId);
       selectedInstance = cockroachInstances.find(i => i.id === instanceId);
     } else {
-      const upperPair = pair.toUpperCase();
-      selectedInstance = cockroachInstances.find(inst => 
-        inst.pairs.map(p => p.toUpperCase()).includes(upperPair)
-      );
+      const upperPair = pair.toUpperCase().trim();
+      const stocksList = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"];
+      selectedInstance = cockroachInstances.find(inst => {
+        const mappedPairs = inst.pairs.map(p => p.toUpperCase());
+        if (mappedPairs.includes(upperPair)) return true;
+        if (stocksList.includes(upperPair) && mappedPairs.includes(upperPair + "M")) return true;
+        if (upperPair.endsWith("M") && stocksList.includes(upperPair.slice(0, -1)) && mappedPairs.includes(upperPair.slice(0, -1))) return true;
+        return false;
+      });
       if (selectedInstance) {
         pool = getPoolForInstance(selectedInstance.id);
       }
@@ -6889,7 +6894,7 @@ async function startServer() {
   });
 
   // 4.1. Remote Warehouse Candles Redirection Request & Database Fallback
-  app.get("/api/warehouse-candles", async (req: Request, res: Response) => {
+  const handleWarehouseCandles = async (req: Request, res: Response) => {
     const symbol = (req.query.symbol || req.query.pair || "").toString().trim().toUpperCase();
     const source = (req.query.source || "").toString().trim().toLowerCase();
     const timeframe = (req.query.timeframe || req.query.interval || "").toString().trim().toLowerCase();
@@ -6924,8 +6929,6 @@ async function startServer() {
       res.status(400).json({ error: "Missing required parameter: 'timeframe' or 'interval' is mandatory." });
       return;
     }
-
-
 
     const startTime = startTimeRaw || undefined;
     const endTime = endTimeRaw || undefined;
@@ -7017,9 +7020,15 @@ async function startServer() {
     // C. Direct Query: Read from CockroachDB instance or Sandbox Cache
     const mappedInterval = mapTimeframeToInterval(timeframe);
     let pool: pg.Pool | null = null;
-    let selectedInstance = cockroachInstances.find(inst => 
-      inst.pairs.map(p => p.toUpperCase()).includes(symbol)
-    );
+    
+    const stocksList = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"];
+    let selectedInstance = cockroachInstances.find(inst => {
+      const mappedPairs = inst.pairs.map(p => p.toUpperCase());
+      if (mappedPairs.includes(symbol)) return true;
+      if (stocksList.includes(symbol) && mappedPairs.includes(symbol + "M")) return true;
+      if (symbol.endsWith("M") && stocksList.includes(symbol.slice(0, -1)) && mappedPairs.includes(symbol.slice(0, -1))) return true;
+      return false;
+    });
 
     if (selectedInstance) {
       pool = getPoolForInstance(selectedInstance.id);
@@ -7100,7 +7109,9 @@ async function startServer() {
     res.status(400).json({
       error: `No database connection is available for pair '${symbol}' or interval '${timeframe}'. Please verify that the database connection URLs inside the environment secrets (COCKROACH_DB_URL_1, COCKROACH_DB_URL_2, etc.) are correctly set up.`
     });
-  });
+  };
+
+  app.get("/api/warehouse-candles", handleWarehouseCandles);
 
   // Helper function to map custom timeframe settings back to Cockroach 3-interval standard
   function mapTimeframeToInterval(tf: string): MarketInterval {
@@ -8513,7 +8524,7 @@ async function startServer() {
     limitVal = 1000
   ): Promise<any[]> {
     const baseInterval = getBaseIntervalForRequested(requestedInterval);
-    const tableName = getDynamicTableName(source, pair, baseInterval);
+    let tableName = getDynamicTableName(source, pair, baseInterval);
     
     try {
       const connStr = (targetPool as any).options?.connectionString || "";
@@ -8524,24 +8535,47 @@ async function startServer() {
         return cachedCandles.data.map((c: any) => ({ ...c }));
       }
 
-      const cacheKey = `${connStr}:${tableName}`;
-      const cached = tableExistenceCache.get(cacheKey);
-      let exists = false;
+      const upperPair = pair.toUpperCase().trim();
+      const stocksList = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"];
+      const isExness = source.toLowerCase().trim() === "exness";
 
-      if (cached && (now - cached.timestamp) < TABLE_CACHE_TTL) {
-        exists = cached.exists;
+      let exists = false;
+      
+      const checkExists = async (tName: string): Promise<boolean> => {
+        const cacheKey = `${connStr}:${tName}`;
+        const cached = tableExistenceCache.get(cacheKey);
+        if (cached && (now - cached.timestamp) < TABLE_CACHE_TTL) {
+          return cached.exists;
+        }
+        try {
+          const checkRes = await targetPool.query(`
+            SELECT EXISTS (
+              SELECT 1 FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' 
+                AND c.relname = $1
+                AND c.relkind = 'r'
+            );
+          `, [tName]);
+          const flag = checkRes.rows[0].exists;
+          tableExistenceCache.set(cacheKey, { exists: flag, timestamp: now });
+          return flag;
+        } catch (err) {
+          return false;
+        }
+      };
+
+      if (isExness && stocksList.includes(upperPair)) {
+        const tableWithM = getDynamicTableName(source, pair + "m", baseInterval);
+        const existsWithM = await checkExists(tableWithM);
+        if (existsWithM) {
+          tableName = tableWithM;
+          exists = true;
+        } else {
+          exists = await checkExists(tableName);
+        }
       } else {
-        const checkRes = await targetPool.query(`
-          SELECT EXISTS (
-            SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public' 
-            AND c.relname = $1
-            AND c.relkind = 'r'
-          );
-        `, [tableName]);
-        exists = checkRes.rows[0].exists;
-        tableExistenceCache.set(cacheKey, { exists, timestamp: now });
+        exists = await checkExists(tableName);
       }
       
       if (!exists) {

@@ -440,7 +440,7 @@ export default function App() {
   // API Testing Playground State
   const [apiSymbol, setApiSymbol] = useState("EURUSD");
   const [apiSource, setApiSource] = useState("exness");
-  const [apiAssetCategory, setApiAssetCategory] = useState<"other" | "crypto">("other");
+  const [apiAssetCategory, setApiAssetCategory] = useState<"other" | "crypto" | "stocks">("other");
   const [apiTradeType, setApiTradeType] = useState<"spot" | "usdt_future" | "coin_future">("spot");
   const [apiTimeframe, setApiTimeframe] = useState("1h");
   const [apiStartTime, setApiStartTime] = useState<string>(() => {
@@ -3584,6 +3584,21 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => {
+                            setApiAssetCategory("stocks");
+                            setApiSymbol("AAPL");
+                            setApiSource("exness");
+                          }}
+                          className={`flex-1 text-center py-1 font-mono text-[9px] uppercase font-bold cursor-pointer transition-all ${
+                            apiAssetCategory === "stocks"
+                              ? "bg-[#10B981] text-white"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          Stocks
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
                             setApiAssetCategory("crypto");
                             setApiSymbol("BTCUSD");
                             setApiSource("binance");
@@ -3653,7 +3668,12 @@ export default function App() {
                             }
                           });
 
-                          if (apiAssetCategory === "other") {
+                          if (apiAssetCategory === "stocks") {
+                            const stocksList = ["AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "META", "AMD", "GOOGL", "AVGO"];
+                            return stocksList.map((pair) => (
+                              <option key={pair} value={pair}>{pair}</option>
+                            ));
+                          } else if (apiAssetCategory === "other") {
                             return standards.map((pair) => (
                               <option key={pair} value={pair}>{pair}</option>
                             ));
@@ -3673,7 +3693,7 @@ export default function App() {
                         onChange={(e) => setApiSource(e.target.value)}
                         className="w-full bg-[#151921] border border-[#1E232D] text-xs text-white p-2 focus:outline-none focus:border-blue-500 font-mono"
                       >
-                        {apiAssetCategory === "other" ? (
+                        {apiAssetCategory === "other" || apiAssetCategory === "stocks" ? (
                           <>
                             <option value="exness">Exness Feed</option>
                             <option value="dukascopy">Dukascopy Feed</option>
